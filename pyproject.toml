@@ -15,6 +15,10 @@ dependencies = [
     "torchaudio",
     "optimum[openvino]",
     "nncf>=3.0",
+    # MT module: openvino_genai for LLMPipeline
+    "openvino-genai>=2026.0.0.0",
+    "openvino-tokenizers>=2026.0.0.0",
+    "huggingface-hub",
 ]
 
 [tool.uv]

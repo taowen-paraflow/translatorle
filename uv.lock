@@ -479,6 +479,20 @@ wheels = [
 ]
 
 [[package]]
+name = "openvino-genai"
+version = "2026.0.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "openvino-tokenizers", marker = "sys_platform == 'win32'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/0c/ed7e3d54c0ba171b23e91231adaf5b5c3f5343650959e144b5de8f9fcf2b/openvino_genai-2026.0.0.0-2050-cp312-cp312-win_amd64.whl", hash = "sha256:5cfd7c14a697c36af854743f86797b845fe423d0fab9a17d0c6fa5cd5b0cc606", size = 2900307, upload-time = "2026-02-23T16:17:30.9Z" },
+    { url = "https://files.pythonhosted.org/packages/02/80/bc87545dfbbd7f4a3bd1667a4c9b5f1d8e1b476fec34225692bca6a86590/openvino_genai-2026.0.0.0-2050-cp313-cp313-win_amd64.whl", hash = "sha256:ada030b34a9e2fe0c6c406c2af2ce7b6e8cb16654329a469055fdac8a3eba19d", size = 2900293, upload-time = "2026-02-23T16:17:37.673Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/be/3f02a70a16147b08b933908ef1c8af930ecd5c65ba78e14f988112d3d691/openvino_genai-2026.0.0.0-2050-cp314-cp314-win_amd64.whl", hash = "sha256:c59aeab5993c78194dc552cc9249bab509f7e44b1fb2f0d5a90c5e61869f06b8", size = 2900527, upload-time = "2026-02-23T16:17:43.244Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/19/221256ce3b0276bb3ba3ce7e8fc57b2968a662c2acde7427c342d917867f/openvino_genai-2026.0.0.0-2050-cp314-cp314t-win_amd64.whl", hash = "sha256:bb537f5a65203eee12326e6bb9578e834d96d94ab3fa48c806990ef04a455935", size = 2900592, upload-time = "2026-02-23T16:17:47.452Z" },
+]
+
+[[package]]
 name = "openvino-telemetry"
 version = "2025.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1018,10 +1032,13 @@ name = "translatorle"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "huggingface-hub", marker = "sys_platform == 'win32'" },
     { name = "librosa", marker = "sys_platform == 'win32'" },
     { name = "nncf", marker = "sys_platform == 'win32'" },
     { name = "numpy", marker = "sys_platform == 'win32'" },
     { name = "openvino", marker = "sys_platform == 'win32'" },
+    { name = "openvino-genai", marker = "sys_platform == 'win32'" },
+    { name = "openvino-tokenizers", marker = "sys_platform == 'win32'" },
     { name = "optimum", extra = ["openvino"], marker = "sys_platform == 'win32'" },
     { name = "torch", marker = "sys_platform == 'win32'" },
     { name = "torchaudio", marker = "sys_platform == 'win32'" },
@@ -1030,10 +1047,13 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "huggingface-hub" },
     { name = "librosa" },
     { name = "nncf", specifier = ">=3.0" },
     { name = "numpy" },
     { name = "openvino", specifier = ">=2026.0.0" },
+    { name = "openvino-genai", specifier = ">=2026.0.0.0" },
+    { name = "openvino-tokenizers", specifier = ">=2026.0.0.0" },
     { name = "optimum", extras = ["openvino"] },
     { name = "torch", index = "https://download.pytorch.org/whl/xpu" },
     { name = "torchaudio", index = "https://download.pytorch.org/whl/xpu" },
