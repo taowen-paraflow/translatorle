@@ -19,6 +19,9 @@ dependencies = [
     "openvino-genai>=2026.0.0.0",
     "openvino-tokenizers>=2026.0.0.0",
     "huggingface-hub",
+    # GUI
+    "PySide6>=6.7",
+    "sounddevice",
 ]
 
 [tool.uv]
