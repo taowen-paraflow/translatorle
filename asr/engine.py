@@ -91,7 +91,9 @@ class ASREngine:
         self._mel = MelProcessor()
         self._encoder = OVEncoder(device=encoder_device)
         self._decoder = OVDecoder(device=decoder_device)
-        self._tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_DIR, trust_remote_code=True)
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            HF_MODEL_DIR, trust_remote_code=True, fix_mistral_regex=False
+        )
 
         # Pre-compute prompt token sequences
         self._system_tokens = self._build_system_tokens()

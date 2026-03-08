@@ -128,3 +128,30 @@ quant_config = OVWeightQuantizationConfig(bits=4, sym=True, group_size=128, rati
 - 原因: NPU 独占无法同时跑两个模型，GPU 可独立处理 MT
 - ASR on NPU: encoder 24ms + decoder 36.6 tok/s，满足实时需求
 - MT on GPU: 661ms/句，翻译速度最快
+
+### MT KV Cache 复用（Session 模式）
+
+使用 `openvino_genai.LLMPipeline` 的 `start_chat()` / `finish_chat()` API 在多句翻译间复用 KV cache，避免每句都重新 prefill 整个上下文。
+
+**API 用法**：
+```python
+engine = MTEngine(device="GPU")
+engine.start_session("English")        # start_chat(system_prompt)
+result = engine.translate("你好世界。")  # 只 prefill 新句子
+result = engine.translate("今天天气好。") # 复用之前的 KV cache
+engine.finish_session()                 # finish_chat() 释放 KV cache
+```
+
+**自动 token 限制保护**：`needs_reset(max_tokens=400)` 在累积 token 接近 `MAX_PROMPT_LEN`(512) 时触发 `reset_session()`，一次性清空 KV cache 重建会话。
+
+**Benchmark (GPU, 10 句中→英, `bench_session.py`)**：
+
+|  | Stateless | Session | Speedup |
+|--|-----------|---------|---------|
+| 平均每句 | 335 ms | 285 ms | 1.18x |
+| 总耗时 | 3.36 s | 2.85 s | 1.18x |
+| 延迟趋势 (末/首) | 1.05x (变慢) | 0.84x (稳定) | — |
+
+- 10 句级别加速约 18%，主要收益是消除了 prefill 重复
+- **长会话收益更大**：上下文越长，stateless 的 prefill 开销越高，session 模式始终只 prefill 新句子
+- 第 8 句时自动 reset 生效，防止超出 512 token 限制

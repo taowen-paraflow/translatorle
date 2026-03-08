@@ -32,15 +32,18 @@ sounddevice callback → AudioCapture.queue → ASRWorker(QThread) --signal→ U
 
 ```
 用户点 Record
+  → MTWorker.start_session(target_lang)：开始 KV cache 会话
   → AudioCapture.start()：sounddevice 16kHz/mono/float32, 100ms blocks
   → 音频块入 queue.Queue
   → ASRWorker(NPU) 从 queue 读取，调用 engine.feed() → text_updated 信号
   → MainWindow 检测句子边界（。！？等标点）
-  → 完整句子 → MTWorker(GPU) 带上下文翻译 → sentence_translated 信号增量更新翻译区
+  → 完整句子 → MTWorker(GPU) 逐句翻译（KV cache 自动维护上下文）→ sentence_translated 信号增量更新翻译区
+  → 接近 token 上限时自动 reset_session() 重建 KV cache
 用户点 Stop
   → AudioCapture.stop()
   → ASRWorker drain + engine.finish() → session_finished 信号
   → 剩余未翻译文本发送到 MT → 翻译区显示完整结果
+  → MTWorker.finish_session()：释放 KV cache
 ```
 
 ### 设备分配
@@ -104,8 +107,10 @@ worker.translation_done(str) # 全文翻译结果（Translate 按钮触发）
 worker.error(str)            # 错误信息
 
 # 命令
-worker.translate_sentence(sentence, target_lang, context)  # 录音中逐句翻译，context 为前文
-worker.translate(text, target_lang)  # 全文翻译（手动 Translate 按钮）
+worker.start_session(target_lang)                # 开始 KV cache 会话
+worker.finish_session()                          # 结束会话，释放 KV cache
+worker.translate_sentence(sentence, target_lang) # 录音中逐句翻译（会话模式自动复用 KV cache）
+worker.translate(text, target_lang)              # 全文翻译（手动 Translate 按钮）
 worker.shutdown()
 ```
 
@@ -151,4 +156,3 @@ worker.shutdown()
 
 启动时可能出现：
 - `XPU device count is zero!` — torch XPU 初始化提示，不影响 NPU 推理
-- `incorrect regex pattern` — Qwen3 tokenizer 已知 warning，不影响功能

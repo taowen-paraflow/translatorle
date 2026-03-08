@@ -152,6 +152,9 @@ class MainWindow(QMainWindow):
             self._translated_pos = 0
             self._translated_sentences = []
             self._sent_sources = set()
+            # Start MT session for KV cache reuse across sentences
+            target_lang = self.combo_lang.currentText()
+            self.mt.start_session(target_lang)
             self.asr.start_session()
             self.audio.start()
             self.lbl_status.setText("Status: Recording...")
@@ -174,8 +177,8 @@ class MainWindow(QMainWindow):
         the tail) or ``len(text)`` when *flush* is True (session finished,
         text is final).
 
-        Each confirmed sentence is dispatched to the MT worker with
-        previously translated sentences as context.
+        Each confirmed sentence is dispatched to the MT worker. In session
+        mode, the MT engine maintains context via KV cache automatically.
         """
         stable_end = len(text) if flush else len(text) - _STABLE_MARGIN
         if stable_end <= self._translated_pos:
@@ -200,8 +203,7 @@ class MainWindow(QMainWindow):
             self._sent_sources.add(sentence)
 
             target_lang = self.combo_lang.currentText()
-            context = "\n".join(self._translated_sentences)
-            self.mt.translate_sentence(sentence, target_lang, context)
+            self.mt.translate_sentence(sentence, target_lang)
 
         # Advance _translated_pos past the consumed sentences
         if last_boundary > 0:
@@ -234,9 +236,11 @@ class MainWindow(QMainWindow):
         if remaining and remaining not in self._sent_sources:
             self._sent_sources.add(remaining)
             target_lang = self.combo_lang.currentText()
-            context = "\n".join(self._translated_sentences)
-            self.mt.translate_sentence(remaining, target_lang, context)
+            self.mt.translate_sentence(remaining, target_lang)
             self._translated_pos = len(text)
+
+        # End MT session (queued after all pending translations)
+        self.mt.finish_session()
 
         self.btn_record.setEnabled(True)
 
