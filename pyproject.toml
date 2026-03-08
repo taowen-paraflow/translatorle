@@ -22,6 +22,8 @@ dependencies = [
     # GUI
     "PySide6>=6.7",
     "sounddevice",
+    "python-dateutil>=2.9.0.post0",
+    "protobuf>=5.29,<6",
 ]
 
 [tool.uv]

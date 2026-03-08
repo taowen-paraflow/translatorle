@@ -164,6 +164,16 @@ NPU 编译首次约 8s（后续有缓存），推理 RTF ~0.17x（4.2s 中文音
 | 中文 test_zh.wav | 4.2s | 822ms | 0.199x |
 | 英文 test_en.wav | 15.1s | 2591ms | 0.172x |
 
+### Decoder 量化对比
+
+| 精度 | 模型大小 | Prefill | Decode | 吞吐量 |
+|------|---------|---------|--------|--------|
+| **FP16** | 1137 MB | 64 ms | 22.6 ms/tok | **40.7 tok/s** |
+| INT4_SYM | 366 MB | 113 ms | 37.0 ms/tok | 24.6 tok/s |
+
+**结论：0.6B 小模型在 NPU 上 FP16 已是最优精度，INT4 反而更慢。**
+量化脚本：`asr/scripts/quantize_decoder.py`，基准测试：`asr/scripts/bench_decoder.py`。
+
 ## 依赖
 
 核心依赖（见 `pyproject.toml`）：

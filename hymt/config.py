@@ -4,8 +4,8 @@ from pathlib import Path
 
 # Paths
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
-MT_MODEL_DIR = str(MODELS_DIR / "hy_mt_ov")
-MT_CACHE_DIR = str(MODELS_DIR / "hy_mt_cache")
+MT_MODEL_DIR = str(MODELS_DIR / "hy_mt_int4sym")
+MT_CACHE_DIR = str(MODELS_DIR / "hy_mt_cache_sym")
 
 # NPU config for openvino_genai.LLMPipeline
 NPU_CONFIG = {
