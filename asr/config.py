@@ -8,7 +8,7 @@ HF_MODEL_DIR = str(MODELS_DIR / "Qwen3-ASR-0.6B")
 
 # Audio
 SAMPLE_RATE = 16000
-MEL_T_FIXED = 800  # Fixed mel frames (5 seconds of audio)
+MEL_T_FIXED = 800  # Fixed mel frames (~8 seconds of audio at hop=160)
 AUDIO_PAD_COUNT = 104  # Encoder output token count
 
 # Special token IDs (Qwen3-ASR ChatML)
@@ -25,6 +25,9 @@ CHUNK_SIZE_SEC = 2.0
 UNFIXED_CHUNK_NUM = 2
 UNFIXED_TOKEN_NUM = 5
 MAX_NEW_TOKENS = 32
+ENCODER_HOP_LENGTH = 160  # WhisperFeatureExtractor hop_length
+AUDIO_WINDOW_SAMPLES = MEL_T_FIXED * ENCODER_HOP_LENGTH  # 128000 samples = ~8 seconds
+MAX_PREFIX_TOKENS = 100  # Keep prefix within NPU prompt budget (256 - ~131 fixed tokens - ~25 margin)
 
 # Model file paths
 ENCODER_XML = str(MODELS_DIR / "encoder_fp16.xml")

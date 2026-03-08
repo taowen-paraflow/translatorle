@@ -18,10 +18,9 @@ uv run python -m app
 ## 使用流程
 
 1. 点击 **Record** 开始录音，对麦克风说话
-2. 实时转写文本显示在 Transcription 区域
-3. 点击 **Stop** 停止录音，自动检测语言并翻译
-4. 翻译结果显示在 Translation 区域
-5. 可手动切换目标语言后点 **Translate** 重新翻译
+2. 实时转写文本显示在 Transcription 区域；每当 ASR 输出完整句子（以。！？等标点结尾），自动发送到 MT 翻译，Translation 区域增量更新
+3. 点击 **Stop** 停止录音，剩余未翻译文本发送到 MT 完成翻译
+4. 可手动切换目标语言后点 **Translate** 重新翻译全文
 
 ## 架构
 
@@ -35,16 +34,21 @@ sounddevice callback → AudioCapture.queue → ASRWorker(QThread) --signal→ U
 用户点 Record
   → AudioCapture.start()：sounddevice 16kHz/mono/float32, 100ms blocks
   → 音频块入 queue.Queue
-  → ASRWorker 从 queue 读取，调用 engine.feed() → text_updated 信号更新 UI
+  → ASRWorker(NPU) 从 queue 读取，调用 engine.feed() → text_updated 信号
+  → MainWindow 检测句子边界（。！？等标点）
+  → 完整句子 → MTWorker(GPU) 带上下文翻译 → sentence_translated 信号增量更新翻译区
 用户点 Stop
   → AudioCapture.stop()
   → ASRWorker drain + engine.finish() → session_finished 信号
-  → 自动调用 MTWorker.translate() → translation_done 信号更新 UI
+  → 剩余未翻译文本发送到 MT → 翻译区显示完整结果
 ```
 
-### NPU 防冲突
+### 设备分配
 
-录音期间只跑 ASR 推理，Translate 按钮禁用。停止录音后才触发 MT 推理。两个引擎分别在各自的 QThread 中初始化，避免 OpenVINO/NPUW 线程安全问题。
+- ASR（encoder + decoder） → NPU
+- HY-MT → GPU
+
+ASR 和 MT 运行在不同硬件上，因此可以并发推理：录音期间 ASR 在 NPU 上持续转写，MT 在 GPU 上逐句翻译已完成的句子，无需等录音结束。两个引擎分别在各自的 QThread 中初始化。
 
 ## 文件结构
 
@@ -91,15 +95,17 @@ worker.shutdown()            # 退出线程
 
 ```python
 worker = MTWorker()
-worker.start()               # 启动线程，加载 MTEngine(NPU)
+worker.start()               # 启动线程，加载 MTEngine(GPU)
 
 # 信号
 worker.engine_ready          # 引擎加载完成
-worker.translation_done(str) # 翻译结果
+worker.sentence_translated(str, str)  # (原文, 译文) — 逐句增量翻译
+worker.translation_done(str) # 全文翻译结果（Translate 按钮触发）
 worker.error(str)            # 错误信息
 
 # 命令
-worker.translate(text, target_lang)  # "Chinese", "English", "Japanese" 等
+worker.translate_sentence(sentence, target_lang, context)  # 录音中逐句翻译，context 为前文
+worker.translate(text, target_lang)  # 全文翻译（手动 Translate 按钮）
 worker.shutdown()
 ```
 
@@ -130,7 +136,7 @@ worker.shutdown()
 2. **Engine 在 worker 线程初始化** — 避免 OpenVINO/NPUW 线程安全问题
 3. **Command queue 模式** — Worker 用 `queue.Queue` 接收命令，比 Qt 信号更简单可控
 4. **AudioCapture 自持 queue** — MainWindow 通过 `audio.queue` 传给 ASRWorker，避免外部 queue 与内部 queue 不一致
-5. **录音停止后自动翻译** — 根据 ASR 检测的语言自动设置翻译方向（中→英 / 其他→中）
+5. **边 ASR 边翻译** — ASR(NPU) 和 MT(GPU) 在不同硬件上并发运行，句子完成即送翻译，无需等录音结束
 6. **Record 按钮 checkable** — 切换录音/停止状态，录音结束到 session_finished 期间禁用防止重复点击
 
 ## 依赖

@@ -1,3 +1,5 @@
+import re
+
 from PySide6.QtCore import Slot
 from PySide6.QtWidgets import (
     QComboBox,
@@ -5,6 +7,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QScrollBar,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -13,6 +16,13 @@ from PySide6.QtWidgets import (
 from app.audio_capture import AudioCapture
 from app.asr_worker import ASRWorker
 from app.mt_worker import MTWorker
+
+# Sentence-ending punctuation followed by optional whitespace
+_SENTENCE_END_RE = re.compile(r"[。！？；.!?;]\s*")
+
+# ASR prefix rollback can revise the last ~5 tokens (~10 chars).  Only treat a
+# sentence boundary as confirmed when at least this many chars follow it.
+_STABLE_MARGIN = 20
 
 
 class MainWindow(QMainWindow):
@@ -31,6 +41,11 @@ class MainWindow(QMainWindow):
         self._asr_ready = False
         self._mt_ready = False
 
+        # Streaming translation state
+        self._translated_pos = 0  # char position up to which text has been sent to MT
+        self._translated_sentences = []  # list of translated sentence strings
+        self._sent_sources: set[str] = set()  # source sentences already queued to MT
+
         # --- signal connections ---
         self.asr.engine_ready.connect(self._on_asr_ready)
         self.asr.text_updated.connect(self._on_text_updated)
@@ -38,11 +53,10 @@ class MainWindow(QMainWindow):
         self.asr.error.connect(self._on_error)
 
         self.mt.engine_ready.connect(self._on_mt_ready)
-        self.mt.translation_done.connect(self._on_translation_done)
+        self.mt.sentence_translated.connect(self._on_sentence_translated)
         self.mt.error.connect(self._on_error)
 
         self.btn_record.toggled.connect(self._on_record_toggled)
-        self.btn_translate.clicked.connect(self._on_translate_clicked)
 
         # Disable recording until both engines report ready
         self.btn_record.setEnabled(False)
@@ -72,10 +86,6 @@ class MainWindow(QMainWindow):
             ["Chinese", "English", "Japanese", "Korean", "Cantonese"]
         )
         toolbar.addWidget(self.combo_lang)
-
-        self.btn_translate = QPushButton("Translate")
-        self.btn_translate.setEnabled(False)
-        toolbar.addWidget(self.btn_translate)
 
         layout.addLayout(toolbar)
 
@@ -114,15 +124,34 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("Status: Ready")
 
     # ------------------------------------------------------------------
+    # Auto-scroll helper
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_scrollbar_near_bottom(scrollbar: QScrollBar, threshold: int = 20) -> bool:
+        """Return True if the scrollbar is within *threshold* px of the bottom."""
+        return scrollbar.value() >= scrollbar.maximum() - threshold
+
+    def _set_text_autoscroll(self, text_edit: QTextEdit, text: str):
+        """Set plain text on *text_edit*, auto-scrolling only if already at bottom."""
+        vbar = text_edit.verticalScrollBar()
+        was_at_bottom = self._is_scrollbar_near_bottom(vbar)
+        text_edit.setPlainText(text)
+        if was_at_bottom:
+            vbar.setValue(vbar.maximum())
+
+    # ------------------------------------------------------------------
     # Recording slots
     # ------------------------------------------------------------------
     @Slot(bool)
     def _on_record_toggled(self, checked: bool):
         if checked:
             self.btn_record.setText("Stop")
-            self.btn_translate.setEnabled(False)
             self.txt_transcription.clear()
             self.txt_translation.clear()
+            # Reset streaming translation state
+            self._translated_pos = 0
+            self._translated_sentences = []
+            self._sent_sources = set()
             self.asr.start_session()
             self.audio.start()
             self.lbl_status.setText("Status: Recording...")
@@ -134,15 +163,61 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("Status: Processing...")
 
     # ------------------------------------------------------------------
+    # Sentence boundary detection
+    # ------------------------------------------------------------------
+    def _check_new_sentences(self, text: str, flush: bool = False):
+        """Detect confirmed sentences in new text and send them to MT.
+
+        Scans *text* from ``self._translated_pos`` up to a **stable boundary**
+        looking for sentence-ending punctuation.  The stable boundary is
+        ``len(text) - _STABLE_MARGIN`` during streaming (ASR may still revise
+        the tail) or ``len(text)`` when *flush* is True (session finished,
+        text is final).
+
+        Each confirmed sentence is dispatched to the MT worker with
+        previously translated sentences as context.
+        """
+        stable_end = len(text) if flush else len(text) - _STABLE_MARGIN
+        if stable_end <= self._translated_pos:
+            return
+
+        region = text[self._translated_pos : stable_end]
+        if not region:
+            return
+
+        last_boundary = 0
+        for m in _SENTENCE_END_RE.finditer(region):
+            sentence = region[last_boundary : m.end()].strip()
+            last_boundary = m.end()
+            if not sentence:
+                continue
+
+            # Content-based dedup: skip sentences already sent to MT.
+            # This guards against _translated_pos becoming misaligned when
+            # ASR prefix rollback or segment commits reorganise the text.
+            if sentence in self._sent_sources:
+                continue
+            self._sent_sources.add(sentence)
+
+            target_lang = self.combo_lang.currentText()
+            context = "\n".join(self._translated_sentences)
+            self.mt.translate_sentence(sentence, target_lang, context)
+
+        # Advance _translated_pos past the consumed sentences
+        if last_boundary > 0:
+            self._translated_pos += last_boundary
+
+    # ------------------------------------------------------------------
     # ASR slots
     # ------------------------------------------------------------------
     @Slot(str)
     def _on_text_updated(self, text: str):
-        self.txt_transcription.setPlainText(text)
+        self._set_text_autoscroll(self.txt_transcription, text)
+        self._check_new_sentences(text)
 
     @Slot(str, str)
     def _on_session_finished(self, text: str, language: str):
-        self.txt_transcription.setPlainText(text)
+        self._set_text_autoscroll(self.txt_transcription, text)
 
         # Auto-detect translation direction
         if "Chinese" in language or "\u4e2d\u6587" in language:
@@ -152,29 +227,29 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self.combo_lang.setCurrentIndex(idx)
 
-        # Auto-translate if there is content
-        if text.strip():
-            self.mt.translate(text, self.combo_lang.currentText())
-            self.lbl_status.setText("Status: Translating...")
+        # Flush all remaining text (now stable since session is finished)
+        self._check_new_sentences(text, flush=True)
+        # Send any trailing text that didn't end with punctuation
+        remaining = text[self._translated_pos :].strip()
+        if remaining and remaining not in self._sent_sources:
+            self._sent_sources.add(remaining)
+            target_lang = self.combo_lang.currentText()
+            context = "\n".join(self._translated_sentences)
+            self.mt.translate_sentence(remaining, target_lang, context)
+            self._translated_pos = len(text)
 
         self.btn_record.setEnabled(True)
 
     # ------------------------------------------------------------------
     # Translation slots
     # ------------------------------------------------------------------
-    @Slot()
-    def _on_translate_clicked(self):
-        text = self.txt_transcription.toPlainText()
-        if text.strip():
-            self.mt.translate(text, self.combo_lang.currentText())
-            self.btn_translate.setEnabled(False)
-            self.lbl_status.setText("Status: Translating...")
-
-    @Slot(str)
-    def _on_translation_done(self, text: str):
-        self.txt_translation.setPlainText(text)
-        self.btn_translate.setEnabled(True)
-        self.lbl_status.setText("Status: Ready")
+    @Slot(str, str)
+    def _on_sentence_translated(self, source: str, translation: str):
+        """Handle incremental sentence translation result."""
+        self._translated_sentences.append(translation)
+        self._set_text_autoscroll(
+            self.txt_translation, "\n".join(self._translated_sentences)
+        )
 
     # ------------------------------------------------------------------
     # Error handling
@@ -184,7 +259,6 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText(f"Status: Error: {msg}")
         self.btn_record.setChecked(False)
         self.btn_record.setEnabled(self._asr_ready and self._mt_ready)
-        self.btn_translate.setEnabled(True)
 
     # ------------------------------------------------------------------
     # Cleanup

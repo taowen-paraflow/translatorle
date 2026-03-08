@@ -91,3 +91,40 @@ quant_config = OVWeightQuantizationConfig(bits=4, sym=True, group_size=128, rati
 | 1-2B | INT4_SYM (group=128) | HY-MT 1.8B: 38.5 tok/s |
 | 1-2B + DynQuant | 不推荐 | HY-MT 1.8B: 26.5 tok/s (慢 31%) |
 | ≥7B (Lunar Lake+) | INT4_SYM + dynamic quant | 理论最优，待验证 |
+
+## 多设备性能对比
+
+### Benchmark Results (2026-03-08)
+
+**ASR Encoder** (FP16, conv model, input [1,128,800]):
+| Device | Avg Inference |
+|--------|-------------|
+| CPU | 405.8 ms |
+| GPU | **11.4 ms** |
+| NPU | 24.3 ms |
+
+**ASR Decoder** (FP16, 0.6B LLM, prefill 128 tokens + decode 20 tokens):
+| Device | Prefill | Decode tok/s |
+|--------|---------|-------------|
+| CPU | 1.23 s | 21.4 |
+| GPU | 75 ms | 42.7 |
+| NPU | 85 ms | 36.6 |
+
+**HY-MT** (INT4_SYM, 1.8B LLM, 翻译一句中文→英文):
+| Device | Avg Translation |
+|--------|----------------|
+| CPU | 899 ms |
+| GPU | 661 ms |
+| NPU | 1.27 s |
+
+### Key Findings:
+- GPU 全面最快，甚至 LLM decode 也比 NPU 快 (42.7 vs 36.6 tok/s)
+- NPU 对 MT 1.8B 反而最慢 (1.27s vs GPU 661ms)，可能是 INT4_SYM 在 NPU 上的 prefill 效率低
+- CPU 的 encoder 极慢 (406ms vs GPU 11ms)，不适合实时 ASR
+- ASR encoder 是 conv 模型，GPU 优势最大 (35x faster than CPU)
+
+### 设备分配策略（边 ASR 边翻译）
+- **当前配置**: ASR(encoder+decoder) → NPU, HY-MT → GPU
+- 原因: NPU 独占无法同时跑两个模型，GPU 可独立处理 MT
+- ASR on NPU: encoder 24ms + decoder 36.6 tok/s，满足实时需求
+- MT on GPU: 661ms/句，翻译速度最快

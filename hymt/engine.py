@@ -25,21 +25,30 @@ class MTEngine:
 
         if device == "NPU":
             config = {**NPU_CONFIG, "CACHE_DIR": MT_CACHE_DIR}
-            self._pipe = ov_genai.LLMPipeline(MT_MODEL_DIR, device, **config)
+        elif device in ("CPU", "GPU"):
+            config = {"PERFORMANCE_HINT": "LATENCY", "NUM_STREAMS": "1"}
         else:
-            self._pipe = ov_genai.LLMPipeline(MT_MODEL_DIR, device)
+            config = {}
 
-    def translate(self, text: str, target_lang: str = "Chinese") -> str:
+        self._pipe = ov_genai.LLMPipeline(MT_MODEL_DIR, device, **config)
+
+    def translate(self, text: str, target_lang: str = "Chinese", context: str = "") -> str:
         """Translate text to the target language.
 
         Args:
             text: Source text to translate.
             target_lang: Target language name (e.g. "Chinese", "English", "Japanese").
+            context: Optional context to guide the translation (e.g. prior sentences,
+                     glossary, or domain hints). When provided, uses the HY-MT
+                     contextual translation template.
 
         Returns:
             Translated text.
         """
-        prompt = self._build_prompt(text, target_lang)
+        if context:
+            prompt = self._build_context_prompt(text, target_lang, context)
+        else:
+            prompt = self._build_prompt(text, target_lang)
         result = self._pipe.generate(prompt, max_new_tokens=self.max_new_tokens)
         return result.strip()
 
@@ -54,4 +63,34 @@ class MTEngine:
             return (
                 f"Translate the following segment into {target_lang}, "
                 f"without additional explanation.\n\n{text}"
+            )
+
+    @staticmethod
+    def _build_context_prompt(text: str, target_lang: str, context: str) -> str:
+        """Build contextual translation prompt following HY-MT template.
+
+        When context is provided (e.g. prior sentences or glossary), the model
+        is instructed to use it as reference without translating it.
+
+        Args:
+            text: Source text to translate.
+            target_lang: Target language name.
+            context: Reference context for the translation.
+
+        Returns:
+            Formatted prompt string.
+        """
+        if not context:
+            return MTEngine._build_prompt(text, target_lang)
+        if target_lang.lower() in ("chinese", "中文"):
+            return (
+                f"{context}\n"
+                f"参考上面的信息，把下面的文本翻译成中文，"
+                f"注意不需要翻译上文，也不要额外解释：\n\n{text}"
+            )
+        else:
+            return (
+                f"{context}\n"
+                f"Refer to the above, translate the following into {target_lang}, "
+                f"without translating the above or additional explanation.\n\n{text}"
             )

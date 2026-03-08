@@ -1,16 +1,22 @@
 """Streaming ASR inference engine.
 
-Implements the "accumulated re-encoding + prefix rollback" strategy from Qwen3-ASR
-using OpenVINO (encoder on NPU, decoder on NPU with KV-cache via NPUW_LLM).
+Implements "accumulated re-encoding + prefix rollback" within fixed-length segments.
+
+The OpenVINO encoder accepts a fixed [1,128,800] mel input (~8s of audio).
+For long streams, audio is processed in ~8s segments: within each segment the
+standard Qwen3-ASR strategy (accumulate audio, re-encode, prefix rollback) is
+used. When a segment fills the encoder window, the transcription is committed
+and a fresh segment starts.
 
 Core loop per chunk:
   1. Accumulate new audio into audio_accum
-  2. Compute mel spectrogram for all accumulated audio
+  2. Compute mel spectrogram for accumulated audio
   3. Run encoder -> audio features [1, 104, 1024]
   4. Build prompt tokens (system + user + assistant prefix)
   5. Build inputs_embeds (text embeddings + audio features)
   6. Run decoder: reset KV-cache, prefill, greedy decode
   7. Parse output, apply prefix rollback for next chunk
+  8. If segment full, commit text and reset for next segment
 """
 
 from dataclasses import dataclass, field
@@ -33,6 +39,7 @@ from .config import (
     UNFIXED_CHUNK_NUM,
     UNFIXED_TOKEN_NUM,
     MAX_NEW_TOKENS,
+    AUDIO_WINDOW_SAMPLES,
 )
 from .ov_encoder import OVEncoder
 from .ov_decoder import OVDecoder
@@ -48,6 +55,7 @@ class StreamingState:
     language: str = ""
     text: str = ""
     _raw_decoded: str = ""
+    _committed_text: str = ""   # Text confirmed from prefix overflow
 
 
 class ASREngine:
@@ -179,7 +187,10 @@ class ASREngine:
 
         # 7. Update state
         state._raw_decoded = (prefix + gen_text) if prefix else gen_text
-        state.language, state.text = self._parse_output(state._raw_decoded)
+        lang, recent_text = self._parse_output(state._raw_decoded)
+        if lang:
+            state.language = lang
+        state.text = state._committed_text + recent_text
         state.chunk_id += 1
 
     def _parse_output(self, raw: str) -> tuple[str, str]:
@@ -218,10 +229,28 @@ class ASREngine:
         """Create a new streaming session state."""
         return StreamingState()
 
+    def _commit_segment(self, state: StreamingState):
+        """Commit current segment's transcription and reset for the next segment.
+
+        Called when audio_accum fills the encoder window (~8s).  The decoded
+        text is appended to _committed_text and the per-segment state (audio
+        buffer, raw decoded text, chunk counter) is cleared so the next audio
+        starts a fresh segment.
+        """
+        _, recent_text = self._parse_output(state._raw_decoded)
+        if recent_text:
+            state._committed_text += recent_text
+        state._raw_decoded = ""
+        state.audio_accum = np.zeros(0, dtype=np.float32)
+        state.chunk_id = 0
+        state.text = state._committed_text
+
     def feed(self, pcm: np.ndarray, state: StreamingState):
         """Feed PCM audio samples to the streaming engine.
 
         Buffers samples and runs inference whenever a full chunk is ready.
+        When accumulated audio fills the encoder window (~8s), the current
+        transcription is committed and a new segment begins.
 
         Args:
             pcm: 1D float32 PCM at 16kHz.
@@ -243,6 +272,10 @@ class ASREngine:
                 state.audio_accum = np.concatenate([state.audio_accum, chunk])
 
             self._run_chunk(state)
+
+            # When audio fills encoder window, commit and start new segment
+            if state.audio_accum.shape[0] >= AUDIO_WINDOW_SAMPLES:
+                self._commit_segment(state)
 
     def finish(self, state: StreamingState):
         """Flush remaining buffered audio and run final inference.

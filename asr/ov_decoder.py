@@ -1,11 +1,12 @@
-"""OpenVINO Text Decoder wrapper (NPU or CPU, IR-surgery stateful model).
+"""OpenVINO Text Decoder wrapper (NPU, CPU, or GPU, IR-surgery stateful model).
 
 Uses the IR-surgery model (decoder_stateful_embeds) that accepts inputs_embeds
 with KV-cache stateful behavior for O(n) autoregressive decoding.
 
-Supports two devices:
+Supports three devices:
 - NPU: Uses NPUW_LLM plugin for ~21ms/token. Returns only last-position logits.
 - CPU: Standard stateful inference for ~28ms/token. Returns full sequence logits.
+- GPU: Standard stateful inference similar to CPU path. Returns full sequence logits.
 """
 
 import numpy as np
@@ -15,7 +16,7 @@ from .config import DECODER_XML, EMBED_TABLE_NPY, IM_END, NPU_DECODER_CONFIG
 
 
 class OVDecoder:
-    """Stateful text decoder with inputs_embeds support (NPU or CPU)."""
+    """Stateful text decoder with inputs_embeds support (NPU, CPU, or GPU)."""
 
     def __init__(self, device: str = "NPU"):
         core = ov.Core()
@@ -23,7 +24,7 @@ class OVDecoder:
             self._compiled = core.compile_model(DECODER_XML, "NPU", NPU_DECODER_CONFIG)
         else:
             self._compiled = core.compile_model(
-                DECODER_XML, "CPU", {"PERFORMANCE_HINT": "LATENCY"}
+                DECODER_XML, device, {"PERFORMANCE_HINT": "LATENCY"}
             )
         self._request = self._compiled.create_infer_request()
         self._embed_table = np.load(EMBED_TABLE_NPY)
