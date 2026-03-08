@@ -674,8 +674,8 @@ def main():
         sys.path.insert(0, qwen_asr_src)
         print(f"  Added to sys.path: {qwen_asr_src}")
 
-    # Project root = parent of scripts/
-    project_root = Path(__file__).resolve().parent.parent
+    # Project root = translatorle/ (asr/scripts/ → asr/ → translatorle/)
+    project_root = Path(__file__).resolve().parent.parent.parent
     paths = _resolve_paths(project_root)
 
     print()
