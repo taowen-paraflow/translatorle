@@ -12,22 +12,28 @@ Supports three devices:
 import numpy as np
 import openvino as ov
 
-from .config import DECODER_XML, EMBED_TABLE_NPY, IM_END, NPU_DECODER_CONFIG
+from .config import IM_END
 
 
 class OVDecoder:
     """Stateful text decoder with inputs_embeds support (NPU, CPU, or GPU)."""
 
-    def __init__(self, device: str = "NPU"):
+    def __init__(
+        self,
+        decoder_xml: str,
+        embed_table_npy: str,
+        npu_decoder_config: dict,
+        device: str = "NPU",
+    ):
         core = ov.Core()
         if device == "NPU":
-            self._compiled = core.compile_model(DECODER_XML, "NPU", NPU_DECODER_CONFIG)
+            self._compiled = core.compile_model(decoder_xml, "NPU", npu_decoder_config)
         else:
             self._compiled = core.compile_model(
-                DECODER_XML, device, {"PERFORMANCE_HINT": "LATENCY"}
+                decoder_xml, device, {"PERFORMANCE_HINT": "LATENCY"}
             )
         self._request = self._compiled.create_infer_request()
-        self._embed_table = np.load(EMBED_TABLE_NPY)
+        self._embed_table = np.load(embed_table_npy)
         self._past_len = 0
 
     @property

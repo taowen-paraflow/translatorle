@@ -25,7 +25,6 @@ import numpy as np
 from transformers import AutoTokenizer
 
 from .config import (
-    HF_MODEL_DIR,
     SAMPLE_RATE,
     AUDIO_PAD_COUNT,
     IM_START,
@@ -40,6 +39,7 @@ from .config import (
     UNFIXED_TOKEN_NUM,
     MAX_NEW_TOKENS,
     AUDIO_WINDOW_SAMPLES,
+    ASRModelConfig,
 )
 from .ov_encoder import OVEncoder
 from .ov_decoder import OVDecoder
@@ -73,14 +73,22 @@ class ASREngine:
 
     def __init__(
         self,
-        encoder_device: str = "NPU",
-        decoder_device: str = "NPU",
+        encoder_device: str | None = None,
+        decoder_device: str | None = None,
+        model_config: ASRModelConfig | None = None,
         chunk_size_sec: float = CHUNK_SIZE_SEC,
         unfixed_chunk_num: int = UNFIXED_CHUNK_NUM,
         unfixed_token_num: int = UNFIXED_TOKEN_NUM,
         max_new_tokens: int = MAX_NEW_TOKENS,
         language: str | None = None,
     ):
+        if model_config is None:
+            from .config import ASR_MODEL_0_6B
+            model_config = ASR_MODEL_0_6B
+
+        enc_device = encoder_device or model_config.encoder_device
+        dec_device = decoder_device or model_config.decoder_device
+
         self.chunk_size_sec = chunk_size_sec
         self.chunk_size_samples = int(round(chunk_size_sec * SAMPLE_RATE))
         self.unfixed_chunk_num = unfixed_chunk_num
@@ -88,11 +96,19 @@ class ASREngine:
         self.max_new_tokens = max_new_tokens
         self.language = language
 
-        self._mel = MelProcessor()
-        self._encoder = OVEncoder(device=encoder_device)
-        self._decoder = OVDecoder(device=decoder_device)
+        self._mel = MelProcessor(hf_model_dir=model_config.hf_model_dir)
+        self._encoder = OVEncoder(
+            device=enc_device,
+            encoder_xml=model_config.encoder_xml,
+        )
+        self._decoder = OVDecoder(
+            device=dec_device,
+            decoder_xml=model_config.decoder_xml,
+            embed_table_npy=model_config.embed_table_npy,
+            npu_decoder_config=model_config.npu_decoder_config,
+        )
         self._tokenizer = AutoTokenizer.from_pretrained(
-            HF_MODEL_DIR, trust_remote_code=True, fix_mistral_regex=False
+            model_config.hf_model_dir, trust_remote_code=True, fix_mistral_regex=False
         )
 
         # Pre-compute prompt token sequences

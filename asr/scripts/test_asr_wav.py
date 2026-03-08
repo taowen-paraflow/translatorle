@@ -2,9 +2,10 @@
 
 Usage:
     powershell.exe -Command '$env:Path = "C:\\Users\\taowen\\.local\\bin;$env:Path"; $env:PYTHONIOENCODING = "utf-8"; cd C:\\Apps\\translatorle; uv run python scripts/test_asr_wav.py test_zh.wav'
-    powershell.exe -Command '$env:Path = "C:\\Users\\taowen\\.local\\bin;$env:Path"; $env:PYTHONIOENCODING = "utf-8"; cd C:\\Apps\\translatorle; uv run python scripts/test_asr_wav.py test_en.wav'
+    powershell.exe -Command '$env:Path = "C:\\Users\\taowen\\.local\\bin;$env:Path"; $env:PYTHONIOENCODING = "utf-8"; cd C:\\Apps\\translatorle; uv run python scripts/test_asr_wav.py --model 0.6B test_en.wav'
 """
 
+import argparse
 import os
 import sys
 import time
@@ -22,7 +23,7 @@ def load_wav(path: str, sr: int = 16000) -> np.ndarray:
     return audio.astype(np.float32)
 
 
-def test_file(wav_path: str, encoder_device: str, decoder_device: str,
+def test_file(wav_path: str, model_config,
               language: str | None = None, label: str = ""):
     """Run streaming ASR on a WAV file and return results."""
     from asr import ASREngine
@@ -30,7 +31,7 @@ def test_file(wav_path: str, encoder_device: str, decoder_device: str,
     print(f"\n{'='*60}")
     print(f"  {label}")
     print(f"  File: {os.path.basename(wav_path)}")
-    print(f"  Encoder: {encoder_device}, Decoder: {decoder_device}")
+    print(f"  Encoder: {model_config.encoder_device}, Decoder: {model_config.decoder_device}")
     print(f"{'='*60}")
 
     # Load audio
@@ -41,8 +42,7 @@ def test_file(wav_path: str, encoder_device: str, decoder_device: str,
     # Init engine
     t0 = time.perf_counter()
     engine = ASREngine(
-        encoder_device=encoder_device,
-        decoder_device=decoder_device,
+        model_config=model_config,
         language=language,
     )
     init_time = time.perf_counter() - t0
@@ -89,11 +89,21 @@ def test_file(wav_path: str, encoder_device: str, decoder_device: str,
 
 
 def main():
-    # Determine which file(s) to test
-    wav_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    from asr.config import ASR_MODELS, DEFAULT_ASR_MODEL
 
-    if wav_arg:
-        wav_path = os.path.join(PROJECT_ROOT, wav_arg) if not os.path.isabs(wav_arg) else wav_arg
+    parser = argparse.ArgumentParser(description="Test ASR module with WAV files")
+    parser.add_argument("wav", nargs="?", default=None,
+                        help="WAV file to test (relative to project root or absolute path)")
+    parser.add_argument("--model", choices=list(ASR_MODELS.keys()),
+                        default=DEFAULT_ASR_MODEL,
+                        help=f"ASR model variant (default: {DEFAULT_ASR_MODEL})")
+    args = parser.parse_args()
+
+    model_config = ASR_MODELS[args.model]
+    model_label = f"{args.model} (enc={model_config.encoder_device}, dec={model_config.decoder_device})"
+
+    if args.wav:
+        wav_path = os.path.join(PROJECT_ROOT, args.wav) if not os.path.isabs(args.wav) else args.wav
         if not os.path.exists(wav_path):
             print(f"ERROR: {wav_path} not found")
             sys.exit(1)
@@ -107,12 +117,12 @@ def main():
             language = None
 
         print("=" * 60)
-        print(f"  Translatorle ASR Module Test")
+        print(f"  Translatorle ASR Module Test [{model_label}]")
         print("=" * 60)
 
         text, lang, t, dur = test_file(
-            wav_path, "NPU", "NPU", language=language,
-            label=f"NPU test: {os.path.basename(wav_path)}"
+            wav_path, model_config, language=language,
+            label=f"{model_label}: {os.path.basename(wav_path)}"
         )
         rtf = t / dur
         print(f"\nSummary: RTF={rtf:.3f}x, lang={lang}, text={text}")
@@ -122,24 +132,24 @@ def main():
         en_wav = os.path.join(PROJECT_ROOT, "test_en.wav")
 
         print("=" * 60)
-        print(f"  Translatorle ASR Module Test (all files)")
+        print(f"  Translatorle ASR Module Test (all files) [{model_label}]")
         print("=" * 60)
 
         results = {}
 
         if os.path.exists(zh_wav):
             text, lang, t, dur = test_file(
-                zh_wav, "NPU", "NPU", language="Chinese",
-                label="Chinese (NPU encoder + NPU decoder)"
+                zh_wav, model_config, language="Chinese",
+                label=f"Chinese [{model_label}]"
             )
-            results["zh_npu"] = {"text": text, "lang": lang, "time": t, "duration": dur}
+            results["zh"] = {"text": text, "lang": lang, "time": t, "duration": dur}
 
         if os.path.exists(en_wav):
             text, lang, t, dur = test_file(
-                en_wav, "NPU", "NPU", language="English",
-                label="English (NPU encoder + NPU decoder)"
+                en_wav, model_config, language="English",
+                label=f"English [{model_label}]"
             )
-            results["en_npu"] = {"text": text, "lang": lang, "time": t, "duration": dur}
+            results["en"] = {"text": text, "lang": lang, "time": t, "duration": dur}
 
         # Summary
         print(f"\n{'='*60}")

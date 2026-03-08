@@ -5,12 +5,18 @@ This single script performs ALL model preparation steps:
   2. Load the HunYuanDenseV1ForCausalLM model
   3. Remap weights to Qwen3ForCausalLM format (query_layernorm -> q_norm, etc.)
   4. Save standalone Qwen3ForCausalLM checkpoint
-  5. Export via optimum-intel as a stateful OpenVINO model with weight compression
-  6. Convert tokenizer to OpenVINO format for openvino_genai.LLMPipeline
+  5. Export via optimum-intel (FP16) + convert tokenizer to OpenVINO format
+  6. Re-quantize to INT4_SYM (group_size=128) for NPU via nncf.compress_weights
+
+INT4_SYM is required for Intel NPU -- INT4_ASYM causes fallback to a slow path
+(~1.2 tok/s vs ~29 tok/s).  Step 5 exports FP16 so that nncf can compress the
+weights cleanly in Step 6.
 
 Output layout under models/:
     models/
-    +-- hy_mt_ov/                  Final OpenVINO IR + OV tokenizer (★ inference)
+    +-- hy_mt_ov/                  Intermediate FP16 OpenVINO IR + OV tokenizer
+    +-- hy_mt_int4sym/             INT4_SYM quantized model + OV tokenizer (★ inference)
+    +-- hy_mt_cache_sym/           NPU compilation cache (created at runtime)
     +-- hy_mt_qwen3_standalone/    Intermediate HF checkpoint (Qwen3ForCausalLM)
     +-- HY-MT1.5-1.8B/            Downloaded original weights (if --download)
 
@@ -25,6 +31,7 @@ from __future__ import annotations
 import argparse
 import gc
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -60,6 +67,8 @@ def _resolve_paths(project_root: Path):
         "download_dir": m / "HY-MT1.5-1.8B",
         "standalone_dir": m / "hy_mt_qwen3_standalone",
         "export_dir": m / "hy_mt_ov",
+        "int4sym_dir": m / "hy_mt_int4sym",
+        "cache_dir": m / "hy_mt_cache_sym",
     }
 
 
@@ -184,12 +193,18 @@ def step4_create_standalone(state_dict: dict, paths: dict, model_id: str):
 
 
 # ============================================================================
-# Step 5 -- Export via optimum-intel with weight compression
+# Step 5 -- Export via optimum-intel (FP16, no quantization)
 # ============================================================================
 
 def step5_export_openvino(standalone_dir: str, paths: dict):
+    """Export Qwen3ForCausalLM to OpenVINO IR without quantization.
+
+    We export FP16 here so that Step 6 can apply nncf.compress_weights()
+    cleanly.  Note: optimum-intel auto-applies INT8_ASYM for >1B models
+    unless explicitly disabled with load_in_8bit=False.
+    """
     print("=" * 60)
-    print("Step 5: Exporting to OpenVINO IR with weight compression")
+    print("Step 5: Exporting to OpenVINO IR (FP16, no quantization)")
     print("=" * 60)
     elapsed = _timer()
 
@@ -203,10 +218,12 @@ def step5_export_openvino(standalone_dir: str, paths: dict):
     print(f"  Target: {export_dir}")
     print("  This may take several minutes...")
 
+    # load_in_8bit=False prevents optimum-intel from auto-applying
+    # INT8_ASYM for >1B models.  We want clean FP16 for nncf in Step 6.
     ov_model = OVModelForCausalLM.from_pretrained(
         standalone_dir,
         export=True,
-        load_in_4bit=True,
+        load_in_8bit=False,
     )
     ov_model.save_pretrained(export_dir)
 
@@ -227,6 +244,104 @@ def step5_export_openvino(standalone_dir: str, paths: dict):
         if os.path.isfile(fpath):
             size_mb = os.path.getsize(fpath) / 1024 / 1024
             print(f"    {f}: {size_mb:.1f} MB")
+
+    print(f"  Time: {elapsed():.1f}s")
+    print()
+
+
+# ============================================================================
+# Step 6 -- Re-quantize to INT4_SYM for NPU
+# ============================================================================
+
+def step6_requantize_int4sym(paths: dict):
+    """Re-quantize FP16 model to INT4_SYM using nncf.compress_weights().
+
+    Intel NPU requires INT4_SYM (symmetric quantization without zero points).
+    INT4_ASYM triggers a slow fallback path on NPU (~1.2 tok/s vs ~29 tok/s).
+
+    Parameters:
+      - mode: INT4_SYM (no zero points, NPU-native)
+      - group_size: 128 (standard for 1-2B parameter models)
+    """
+    print("=" * 60)
+    print("Step 6: Re-quantizing to INT4_SYM for NPU")
+    print("=" * 60)
+    elapsed = _timer()
+
+    import openvino as ov
+    import nncf
+
+    src_dir = paths["export_dir"]
+    dst_dir = paths["int4sym_dir"]
+    os.makedirs(str(dst_dir), exist_ok=True)
+
+    src_xml = os.path.join(str(src_dir), "openvino_model.xml")
+    print(f"  Source: {src_xml}")
+    print(f"  Target: {dst_dir}")
+    print("  mode=INT4_SYM, group_size=128")
+    print("  This may take a few minutes...")
+
+    # Load FP16 model from Step 5
+    core = ov.Core()
+    model = core.read_model(src_xml)
+
+    # Apply INT4_SYM quantization
+    compressed = nncf.compress_weights(
+        model,
+        mode=nncf.CompressWeightsMode.INT4_SYM,
+        group_size=128,
+    )
+
+    # Save quantized model
+    dst_xml = os.path.join(str(dst_dir), "openvino_model.xml")
+    ov.save_model(compressed, dst_xml)
+
+    # Release models before copying files
+    del model, compressed
+    _free_memory()
+
+    # Copy all non-model files (tokenizer, configs) from export_dir
+    for fname in sorted(os.listdir(str(src_dir))):
+        if fname.startswith("openvino_model"):
+            continue  # Skip IR files (we just wrote new ones)
+        src_file = os.path.join(str(src_dir), fname)
+        dst_file = os.path.join(str(dst_dir), fname)
+        if os.path.isfile(src_file):
+            shutil.copy2(src_file, dst_file)
+    print("  Copied tokenizer and config files")
+
+    # Size comparison
+    src_bin = os.path.join(str(src_dir), "openvino_model.bin")
+    dst_bin = os.path.join(str(dst_dir), "openvino_model.bin")
+    src_mb = os.path.getsize(src_bin) / 1024 / 1024
+    dst_mb = os.path.getsize(dst_bin) / 1024 / 1024
+    print(f"  FP16 size:     {src_mb:.1f} MB")
+    print(f"  INT4_SYM size: {dst_mb:.1f} MB")
+    print(f"  Compression:   {(1 - dst_mb / src_mb) * 100:.1f}%")
+
+    # Verify no asymmetric artifacts (zero points / Subtract ops)
+    dst_xml_path = os.path.join(str(dst_dir), "openvino_model.xml")
+    with open(dst_xml_path, "r", encoding="utf-8") as f:
+        xml_content = f.read()
+    zp_count = xml_content.count("zero_point")
+    if zp_count == 0:
+        print("  Verified: no zero_point artifacts (pure INT4_SYM)")
+    else:
+        print(f"  WARNING: found {zp_count} zero_point references!")
+
+    # List output files
+    print("  Output files:")
+    for f in sorted(os.listdir(str(dst_dir))):
+        fpath = os.path.join(str(dst_dir), f)
+        if os.path.isfile(fpath):
+            size_mb = os.path.getsize(fpath) / 1024 / 1024
+            print(f"    {f}: {size_mb:.1f} MB")
+
+    # Create NPU compilation cache directory
+    cache_dir = paths["cache_dir"]
+    os.makedirs(str(cache_dir), exist_ok=True)
+    print(f"  Created cache dir: {cache_dir}")
+    print(f"    (populated at runtime on first NPU load)")
 
     print(f"  Time: {elapsed():.1f}s")
     print()
@@ -294,8 +409,11 @@ def main():
     del state_dict
     _free_memory()
 
-    # Step 5: Export to OpenVINO
+    # Step 5: Export to OpenVINO (FP16)
     step5_export_openvino(standalone_dir, paths)
+
+    # Step 6: Re-quantize to INT4_SYM for NPU
+    step6_requantize_int4sym(paths)
 
     total_elapsed = time.perf_counter() - total_start
     print("=" * 60)
@@ -308,7 +426,8 @@ def main():
             continue
         exists = path.exists() if isinstance(path, Path) else os.path.exists(path)
         status = "OK" if exists else "MISSING"
-        print(f"  [{status}] {path}")
+        tag = " (★ inference)" if key == "int4sym_dir" else ""
+        print(f"  [{status}] {path}{tag}")
     print()
 
 

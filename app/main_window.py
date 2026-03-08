@@ -51,6 +51,9 @@ class MainWindow(QMainWindow):
         self.asr.text_updated.connect(self._on_text_updated)
         self.asr.session_finished.connect(self._on_session_finished)
         self.asr.error.connect(self._on_error)
+        self.asr.model_reloaded.connect(self._on_model_reloaded)
+
+        self.combo_asr_model.currentTextChanged.connect(self._on_asr_model_changed)
 
         self.mt.engine_ready.connect(self._on_mt_ready)
         self.mt.sentence_translated.connect(self._on_sentence_translated)
@@ -86,6 +89,16 @@ class MainWindow(QMainWindow):
             ["Chinese", "English", "Japanese", "Korean", "Cantonese"]
         )
         toolbar.addWidget(self.combo_lang)
+
+        # ASR model selector (pushed to the right)
+        from asr.config import ASR_MODELS, DEFAULT_ASR_MODEL
+
+        toolbar.addStretch()
+        toolbar.addWidget(QLabel("ASR Model:"))
+        self.combo_asr_model = QComboBox()
+        self.combo_asr_model.addItems(list(ASR_MODELS.keys()))
+        self.combo_asr_model.setCurrentText(DEFAULT_ASR_MODEL)
+        toolbar.addWidget(self.combo_asr_model)
 
         layout.addLayout(toolbar)
 
@@ -123,6 +136,19 @@ class MainWindow(QMainWindow):
             self.btn_record.setEnabled(True)
             self.lbl_status.setText("Status: Ready")
 
+    @Slot(str)
+    def _on_asr_model_changed(self, model_name: str):
+        if self.btn_record.isChecked():
+            return
+        self.btn_record.setEnabled(False)
+        self.lbl_status.setText(f"Status: Loading ASR model {model_name}...")
+        self.asr.reload_model(model_name)
+
+    @Slot()
+    def _on_model_reloaded(self):
+        self._asr_ready = True
+        self._check_ready()
+
     # ------------------------------------------------------------------
     # Auto-scroll helper
     # ------------------------------------------------------------------
@@ -146,6 +172,7 @@ class MainWindow(QMainWindow):
     def _on_record_toggled(self, checked: bool):
         if checked:
             self.btn_record.setText("Stop")
+            self.combo_asr_model.setEnabled(False)
             self.txt_transcription.clear()
             self.txt_translation.clear()
             # Reset streaming translation state
@@ -242,6 +269,7 @@ class MainWindow(QMainWindow):
         # End MT session (queued after all pending translations)
         self.mt.finish_session()
 
+        self.combo_asr_model.setEnabled(True)
         self.btn_record.setEnabled(True)
 
     # ------------------------------------------------------------------

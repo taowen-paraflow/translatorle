@@ -7,18 +7,16 @@ Supports NPU, CPU, and GPU devices.
 import numpy as np
 import openvino as ov
 
-from .config import ENCODER_XML
-
 
 class OVEncoder:
     """Audio encoder running on NPU/CPU/GPU via OpenVINO."""
 
-    def __init__(self, device: str = "NPU"):
+    def __init__(self, encoder_xml: str, device: str = "NPU"):
         core = ov.Core()
         config = {}
         if device in ("CPU", "GPU"):
             config = {"PERFORMANCE_HINT": "LATENCY"}
-        self._compiled = core.compile_model(ENCODER_XML, device, config)
+        self._compiled = core.compile_model(encoder_xml, device, config)
         self._input_name = self._compiled.inputs[0].any_name
 
     def __call__(self, mel: np.ndarray) -> np.ndarray:

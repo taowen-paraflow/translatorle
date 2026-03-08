@@ -4,6 +4,7 @@ Runs the ASR engine on a dedicated thread, communicating with the main
 (GUI) thread via Qt signals and a simple command queue.
 """
 
+import gc
 import queue
 import traceback
 
@@ -30,12 +31,14 @@ class ASRWorker(QThread):
     text_updated = Signal(str)
     session_finished = Signal(str, str)
     engine_ready = Signal()
+    model_reloaded = Signal()
     error = Signal(str)
 
-    def __init__(self, audio_queue: queue.Queue, parent=None) -> None:
+    def __init__(self, audio_queue: queue.Queue, model_name: str | None = None, parent=None) -> None:
         super().__init__(parent)
         self._audio_queue = audio_queue
-        self._cmd_queue: queue.Queue[str] = queue.Queue()
+        self._model_name = model_name
+        self._cmd_queue: queue.Queue = queue.Queue()
         self._stop_flag = False
 
     # ------------------------------------------------------------------
@@ -55,15 +58,31 @@ class ASRWorker(QThread):
         self._stop_flag = True
         self._cmd_queue.put("quit")
 
+    def reload_model(self, model_name: str) -> None:
+        """Request the worker to load a different ASR model."""
+        self._cmd_queue.put(("reload_model", model_name))
+
+    # ------------------------------------------------------------------
+    # Engine creation helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _create_engine(model_name: str | None):
+        """Create an ASREngine for the given model name."""
+        from asr import ASREngine
+        from asr.config import ASR_MODELS, DEFAULT_ASR_MODEL
+
+        name = model_name or DEFAULT_ASR_MODEL
+        model_config = ASR_MODELS.get(name)
+        return ASREngine(model_config=model_config)
+
     # ------------------------------------------------------------------
     # Thread entry point
     # ------------------------------------------------------------------
 
     def run(self) -> None:  # noqa: C901 -- intentionally linear state machine
         try:
-            from asr import ASREngine
-
-            engine = ASREngine(encoder_device="NPU", decoder_device="NPU")
+            engine = self._create_engine(self._model_name)
         except Exception:
             self.error.emit(
                 f"Failed to load ASR engine:\n{traceback.format_exc()}"
@@ -81,6 +100,20 @@ class ASRWorker(QThread):
 
             if cmd == "quit":
                 break
+
+            if isinstance(cmd, tuple) and cmd[0] == "reload_model":
+                model_name = cmd[1]
+                try:
+                    del engine
+                    gc.collect()
+                    engine = self._create_engine(model_name)
+                    self._model_name = model_name
+                    self.model_reloaded.emit()
+                except Exception:
+                    self.error.emit(
+                        f"Failed to reload ASR model:\n{traceback.format_exc()}"
+                    )
+                continue
 
             if cmd == "start_session":
                 self._run_session(engine)

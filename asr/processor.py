@@ -6,14 +6,14 @@ Uses WhisperFeatureExtractor from transformers to match Qwen3-ASR training.
 import numpy as np
 from transformers import WhisperFeatureExtractor
 
-from .config import HF_MODEL_DIR, SAMPLE_RATE, MEL_T_FIXED
+from .config import SAMPLE_RATE, MEL_T_FIXED
 
 
 class MelProcessor:
     """Converts PCM audio to mel spectrogram features for the encoder."""
 
-    def __init__(self):
-        self._extractor = WhisperFeatureExtractor.from_pretrained(HF_MODEL_DIR)
+    def __init__(self, hf_model_dir: str):
+        self._extractor = WhisperFeatureExtractor.from_pretrained(hf_model_dir)
 
     def __call__(self, audio: np.ndarray) -> np.ndarray:
         """Convert PCM audio to mel spectrogram, padded/trimmed to T_FIXED frames.

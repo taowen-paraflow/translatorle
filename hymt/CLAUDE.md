@@ -1,39 +1,31 @@
-# HY-MT 模块 — HY-MT1.5-1.8B NPU 机器翻译
+# HY-MT 模块 — HY-MT1.5-1.8B 机器翻译
 
-基于腾讯 HY-MT1.5-1.8B，使用 OpenVINO + openvino_genai 在 Intel NPU 上运行机器翻译。
+基于腾讯 HY-MT1.5-1.8B，使用 OpenVINO + openvino_genai 的 `LLMPipeline` 进行推理。
 
 ## 快速开始
 
-### 1. 准备模型
+### 准备模型
 
 ```powershell
-# 从 HuggingFace 下载并导出（需要下载 ~3.8GB + 导出时间）
 $env:PYTHONIOENCODING = "utf-8"
 uv run python hymt/scripts/prepare_mt_models.py
 ```
 
-如果已有本地模型权重：
-
-```powershell
-uv run python hymt/scripts/prepare_mt_models.py --model-id C:\path\to\HY-MT1.5-1.8B --skip-download
-```
-
-### 2. 运行测试
-
-```powershell
-$env:PYTHONIOENCODING = "utf-8"
-uv run python hymt/scripts/test_mt.py
-uv run python hymt/scripts/test_mt.py --device CPU  # CPU 回退
-```
-
-### 3. 代码调用
+### 代码调用
 
 ```python
 from hymt import MTEngine
 
-engine = MTEngine(device="NPU")
+engine = MTEngine(device="GPU")
+
+# 单句翻译
 result = engine.translate("Hello world", target_lang="Chinese")
-print(result)  # "你好，世界。"
+
+# 多句 KV cache 会话模式（节省 prefill）
+engine.start_session("English")
+result1 = engine.translate("你好世界。")
+result2 = engine.translate("今天天气好。")  # 复用 KV cache
+engine.finish_session()
 ```
 
 ## 模型导出流水线
@@ -41,54 +33,44 @@ print(result)  # "你好，世界。"
 `hymt/scripts/prepare_mt_models.py` 执行 5 个步骤：
 
 ```
-Step 1: 下载 tencent/HY-MT1.5-1.8B (HuggingFace)
+Step 1: 下载 tencent/HY-MT1.5-1.8B
 Step 2: 加载 HunYuanDenseV1ForCausalLM
 Step 3: 重映射权重 (query_layernorm -> q_norm, key_layernorm -> k_norm)
-Step 4: 构建独立 Qwen3ForCausalLM checkpoint → hy_mt_qwen3_standalone/
-Step 5: optimum-intel 导出 + 权重压缩 + OV tokenizer 转换 → hy_mt_ov/
+Step 4: 构建独立 Qwen3ForCausalLM checkpoint
+Step 5: optimum-intel 导出 + INT4_SYM 量化 + OV tokenizer 转换
 ```
 
-### 架构映射关键说明
+### 架构映射
 
-HunYuanDenseV1 与 Qwen3 架构几乎完全相同（都有 QK norm），唯一区别是命名：
-- `query_layernorm` → `q_norm`
-- `key_layernorm` → `k_norm`
-
-通过重命名 state dict key 即可直接加载到 Qwen3ForCausalLM。
+HunYuanDenseV1 与 Qwen3 架构相同（都有 QK norm），只需重命名 `query_layernorm → q_norm`, `key_layernorm → k_norm`。
 
 ## 模型文件
 
-导出后 `models/` 目录结构：
-
 ```
 models/
-├── hy_mt_int4sym/               INT4_SYM 模型 (★推理用, ~996MB, 29 tok/s on NPU)
-│   ├── openvino_model.xml/bin   模型 IR
-│   ├── openvino_tokenizer.*     OV tokenizer (LLMPipeline 需要)
-│   └── openvino_detokenizer.*   OV detokenizer
-├── hy_mt_ov/                    INT4_ASYM 旧模型 (不推荐, NPU 上仅 1.2 tok/s)
-├── hy_mt_qwen3_standalone/      Qwen3ForCausalLM HF checkpoint (中间产物)
-└── HY-MT1.5-1.8B/              原始下载权重 (可删除)
+├── hy_mt_int4sym/               # INT4_SYM 模型 ★推理用
+│   ├── openvino_model.xml/bin
+│   ├── openvino_tokenizer.*
+│   └── openvino_detokenizer.*
+└── hy_mt_cache_sym/             # NPU 编译缓存
 ```
 
-推理用：`hy_mt_int4sym/`（config.py 已指向此目录）。
-`hy_mt_ov/`（INT4_ASYM）、`hy_mt_qwen3_standalone/`、`HY-MT1.5-1.8B/` 可删除。
+## KV Cache 会话模式
 
-### 量化经验
+使用 `LLMPipeline.start_chat()` / `finish_chat()` 在多句翻译间复用 KV cache，避免每句重新 prefill 整个上下文。
 
-- `load_in_4bit=True` 默认导出 INT4_ASYM → NPU 回退慢路径 (1.2 tok/s)
-- 重新量化为 INT4_SYM (group_size=128) → 29.0 tok/s，提速 23.4x
-- 脚本：`hymt/scripts/requantize_mt.py`
-
-## 推理架构
-
-```
-Source text → build_prompt() → LLMPipeline.generate() → Translation
+```python
+engine.start_session("English")        # start_chat(system_prompt)
+engine.translate("你好世界。")          # 只 prefill 新句子
+engine.translate("今天天气好。")        # 复用 KV cache
+engine.finish_session()                # finish_chat() 释放 cache
 ```
 
-使用 `openvino_genai.LLMPipeline`，它内部处理 tokenize → prefill → decode → detokenize。
+**自动 token 限制保护**：`needs_reset(max_tokens=400)` 在累积 token 接近 `MAX_PROMPT_LEN`(512) 时触发 `reset_session()`，重建会话。App 层在每句翻译前检查并自动 reset。
 
-### Prompt 模板
+会话模式比无状态模式快约 18%（10 句测试），长会话收益更大。
+
+## Prompt 模板
 
 中文目标：
 ```
@@ -97,21 +79,11 @@ Source text → build_prompt() → LLMPipeline.generate() → Translation
 {source_text}
 ```
 
-其他语言目标：
+其他语言：
 ```
 Translate the following segment into {target_language}, without additional explanation.
 
 {source_text}
-```
-
-## NPU 配置
-
-```python
-NPU_CONFIG = {
-    "MAX_PROMPT_LEN": 512,
-    "NPUW_LLM_PREFILL_CHUNK_SIZE": 512,
-    "GENERATE_HINT": "BEST_PERF",
-}
 ```
 
 ## 模块说明
@@ -119,16 +91,8 @@ NPU_CONFIG = {
 | 模块 | 类 | 职责 |
 |------|----|------|
 | `config.py` | — | 路径常量、NPU 配置 |
-| `engine.py` | `MTEngine` | 翻译引擎：封装 LLMPipeline |
-
-## 依赖
-
-在 `pyproject.toml` 中需要额外添加：
-- `openvino-genai >= 2026.0.0.0` — LLMPipeline 推理
-
-运行环境：Windows 11, Python 3.12, `uv` 管理依赖。
+| `engine.py` | `MTEngine` | 翻译引擎：封装 LLMPipeline + 会话管理 |
 
 ## 支持语言
 
-HY-MT1.5-1.8B 支持 33 种语言之间的互译，包括中、英、日、韩、法、德、西、俄等主要语言，
-以及粤语、藏语、维吾尔语等 5 种民族语言/方言。
+HY-MT1.5-1.8B 支持 33 种语言互译，包括中、英、日、韩、法、德、西、俄等主要语言，以及粤语、藏语、维吾尔语等方言。

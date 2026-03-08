@@ -1,33 +1,43 @@
 """Prepare Qwen3-ASR models for OpenVINO NPU deployment.
 
+Supports both Qwen3-ASR-0.6B and Qwen3-ASR-1.7B.  Model dimensions
+(d_model, hidden_size, decoder config) are auto-detected from the
+loaded model so no hardcoded constants need updating.
+
 This single script performs ALL model preparation steps:
-  1. Load the original Qwen3-ASR-0.6B model (HuggingFace or local)
+  1. Load the original Qwen3-ASR model (HuggingFace or local)
   2. Export the audio encoder to OpenVINO IR (static shape [1, 128, 800])
   3. Extract the text decoder as standalone Qwen3ForCausalLM
   4. Export the decoder via optimum-intel as a stateful model with KV-cache
   5. Perform IR surgery: remove input_ids, add inputs_embeds Parameter
   6. Extract embed_tokens.npy for building inputs_embeds at runtime
+  6b. Quantize decoder to INT4_SYM for >1B models (0.6B stays FP16)
   7. Copy tokenizer / preprocessor files for runtime use
 
-Output layout under models/:
+Output layout:
+  0.6B (flat, backward-compatible):
     models/
     +-- encoder_fp16.xml / .bin          Audio encoder (NPU, static [1,128,800])
-    +-- decoder_stateful_ov/             Intermediate stateful decoder (optimum-intel export)
-    +-- decoder_stateful_embeds/         Final decoder for NPU (IR-surgery, inputs_embeds)
-    +-- qwen3_decoder_standalone/        Intermediate HF checkpoint (Qwen3ForCausalLM)
+    +-- decoder_stateful_embeds/         Final decoder for NPU (FP16)
     +-- embed_tokens.npy                 Embedding table [151936, 1024]
     +-- Qwen3-ASR-0.6B/                  Tokenizer + preprocessor config
 
-Usage (from WSL, targeting Windows Python):
-    powershell.exe -Command '
-        $env:Path = "C:\\Users\\taowen\\.local\\bin;$env:Path";
-        $env:PYTHONIOENCODING = "utf-8";
-        cd C:\\Apps\\translatorle;
-        uv run python scripts/prepare_asr_models.py
-    '
+  1.7B (subdirectory):
+    models/asr_1.7b/
+    +-- encoder_fp16.xml / .bin          Audio encoder
+    +-- decoder_stateful_embeds/         Final decoder for NPU (INT4_SYM)
+    +-- embed_tokens.npy                 Embedding table [vocab_size, 2048]
+    +-- Qwen3-ASR-1.7B/                  Tokenizer + preprocessor config
 
-    # Or with a local model path:
-    uv run python scripts/prepare_asr_models.py --model-id C:\\Models\\Qwen3-ASR-0.6B
+Usage:
+    # 0.6B (default):
+    uv run python asr/scripts/prepare_asr_models.py --model-id Qwen/Qwen3-ASR-0.6B
+
+    # 1.7B:
+    uv run python asr/scripts/prepare_asr_models.py --model-id Qwen/Qwen3-ASR-1.7B
+
+    # Local model path:
+    uv run python asr/scripts/prepare_asr_models.py --model-id C:\\Models\\Qwen3-ASR-1.7B
 """
 
 from __future__ import annotations
@@ -66,17 +76,32 @@ def _free_memory():
 # Resolve paths
 # ---------------------------------------------------------------------------
 
-def _resolve_paths(project_root: Path):
-    """Return a dict of all output paths under models/."""
-    m = project_root / "models"
+def _resolve_paths(
+    project_root: Path,
+    output_subdir: str | None = None,
+    model_name: str = "Qwen3-ASR-0.6B",
+):
+    """Return a dict of all output paths under models/.
+
+    Args:
+        project_root: Repository root (parent of models/).
+        output_subdir: If set (e.g. "asr_1.7b"), outputs go under
+            models/<output_subdir>/. When None, uses the flat models/
+            layout for backward compatibility with 0.6B.
+        model_name: Short model name used as the tokenizer directory
+            (e.g. "Qwen3-ASR-0.6B" or "Qwen3-ASR-1.7B").
+    """
+    base = project_root / "models"
+    if output_subdir:
+        base = base / output_subdir
     return {
-        "models_dir": m,
-        "encoder_xml": m / "encoder_fp16.xml",
-        "decoder_standalone_dir": m / "qwen3_decoder_standalone",
-        "decoder_stateful_ov_dir": m / "decoder_stateful_ov",
-        "decoder_stateful_embeds_dir": m / "decoder_stateful_embeds",
-        "embed_tokens_npy": m / "embed_tokens.npy",
-        "tokenizer_dir": m / "Qwen3-ASR-0.6B",
+        "models_dir": base,
+        "encoder_xml": base / "encoder_fp16.xml",
+        "decoder_standalone_dir": base / "qwen3_decoder_standalone",
+        "decoder_stateful_ov_dir": base / "decoder_stateful_ov",
+        "decoder_stateful_embeds_dir": base / "decoder_stateful_embeds",
+        "embed_tokens_npy": base / "embed_tokens.npy",
+        "tokenizer_dir": base / model_name,
     }
 
 
@@ -124,19 +149,33 @@ class _StaticAudioEncoder(torch.nn.Module):
     Replaces all dynamic operations (chunking by feature_lens, padding,
     cu_seqlens construction) with fixed constants for T_fixed=800.
     Submodules are referenced (not copied) so weights are shared.
+
+    All model-dependent dimensions (d_model, hidden_size, downsample_hidden)
+    are derived from the actual audio_tower so the wrapper works for both
+    0.6B (d_model=896) and 1.7B (d_model=1024) variants.
     """
 
-    # Constants for T_fixed = 800, n_window = 50
+    # Constants for T_fixed = 800, n_window = 50 — same for all model sizes
     N_CHUNKS = 8          # 800 / (n_window * 2)
     CHUNK_LEN = 100       # n_window * 2
     T_AFTER_CNN = 13      # per-chunk time after 3x stride-2 conv
     FREQ_AFTER_CNN = 16   # freq dim after 3x stride-2 conv
     SEQ_LEN = 104         # N_CHUNKS * T_AFTER_CNN
-    D_MODEL = 896
-    DOWNSAMPLE_HIDDEN = 480
 
-    def __init__(self, audio_tower: torch.nn.Module):
+    def __init__(
+        self,
+        audio_tower: torch.nn.Module,
+        d_model: int,
+        hidden_size: int,
+    ):
         super().__init__()
+        self.d_model = d_model
+        self.hidden_size = hidden_size
+
+        # Derive DOWNSAMPLE_HIDDEN from the conv_out linear layer.
+        # conv_out.in_features == DOWNSAMPLE_HIDDEN * FREQ_AFTER_CNN
+        self.downsample_hidden = audio_tower.conv_out.in_features // self.FREQ_AFTER_CNN
+
         self.conv2d1 = audio_tower.conv2d1
         self.conv2d2 = audio_tower.conv2d2
         self.conv2d3 = audio_tower.conv2d3
@@ -165,11 +204,11 @@ class _StaticAudioEncoder(torch.nn.Module):
 
         x = x.permute(0, 3, 1, 2).contiguous().view(
             self.N_CHUNKS, self.T_AFTER_CNN,
-            self.DOWNSAMPLE_HIDDEN * self.FREQ_AFTER_CNN,
+            self.downsample_hidden * self.FREQ_AFTER_CNN,
         )
         x = self.conv_out(x)
         x = x + self.pos_embed.unsqueeze(0)
-        x = x.reshape(self.SEQ_LEN, self.D_MODEL)
+        x = x.reshape(self.SEQ_LEN, self.d_model)
 
         for layer in self.layers:
             x = layer(x, self.cu_seqlens)[0]
@@ -179,7 +218,7 @@ class _StaticAudioEncoder(torch.nn.Module):
         return x.unsqueeze(0)
 
 
-def step2_export_encoder(model, paths: dict):
+def step2_export_encoder(model, paths: dict, *, d_model: int, hidden_size: int):
     print("=" * 60)
     print("Step 2: Exporting audio encoder to OpenVINO IR")
     print("=" * 60)
@@ -195,16 +234,19 @@ def step2_export_encoder(model, paths: dict):
         layer.self_attn.config._attn_implementation = "eager"
 
     # Wrap in static-shape module (bypasses dynamic feature_lens logic)
-    wrapper = _StaticAudioEncoder(audio_tower)
+    wrapper = _StaticAudioEncoder(audio_tower, d_model=d_model, hidden_size=hidden_size)
     wrapper.eval()
+    print(f"  d_model={d_model}, hidden_size={hidden_size}, "
+          f"downsample_hidden={wrapper.downsample_hidden}")
 
     dummy_input = torch.randn(1, 128, 800, dtype=torch.float32)
 
     with torch.no_grad():
         ref_output = wrapper(dummy_input)
     print(f"  Reference output shape: {ref_output.shape}")
-    assert ref_output.shape == (1, 104, 1024), (
-        f"Expected [1, 104, 1024], got {list(ref_output.shape)}"
+    expected_shape = (1, 104, hidden_size)
+    assert ref_output.shape == expected_shape, (
+        f"Expected {list(expected_shape)}, got {list(ref_output.shape)}"
     )
 
     ov_encoder = ov.convert_model(
@@ -263,7 +305,7 @@ def step3_extract_decoder_weights(model):
 # Step 4 -- Create standalone Qwen3ForCausalLM, load weights, save
 # ============================================================================
 
-def step4_create_standalone_decoder(decoder_sd: dict, paths: dict):
+def step4_create_standalone_decoder(decoder_sd: dict, paths: dict, text_config):
     print("=" * 60)
     print("Step 4: Creating standalone Qwen3ForCausalLM")
     print("=" * 60)
@@ -271,33 +313,30 @@ def step4_create_standalone_decoder(decoder_sd: dict, paths: dict):
 
     from transformers import Qwen3Config, Qwen3ForCausalLM
 
-    # Config values from Qwen3-ASR-0.6B/config.json -> thinker_config -> text_config
+    # Build Qwen3Config from the ASR model's text_config (works for any size)
     qwen3_config = Qwen3Config(
-        hidden_size=1024,
-        intermediate_size=3072,
-        max_position_embeddings=65536,
-        num_attention_heads=16,
-        num_hidden_layers=28,
-        num_key_value_heads=8,
-        rms_norm_eps=1e-06,
-        rope_scaling={
-            "interleaved": True,
-            "mrope_interleaved": True,
-            "mrope_section": [24, 20, 20],
-            "rope_type": "default",
-            "type": "default",
-        },
-        rope_theta=1000000.0,
-        sliding_window=None,
-        tie_word_embeddings=True,
-        vocab_size=151936,
-        head_dim=128,
-        attention_dropout=0.0,
-        attention_bias=False,
-        hidden_act="silu",
-        initializer_range=0.02,
+        hidden_size=text_config.hidden_size,
+        intermediate_size=text_config.intermediate_size,
+        max_position_embeddings=text_config.max_position_embeddings,
+        num_attention_heads=text_config.num_attention_heads,
+        num_hidden_layers=text_config.num_hidden_layers,
+        num_key_value_heads=text_config.num_key_value_heads,
+        rms_norm_eps=getattr(text_config, "rms_norm_eps", 1e-6),
+        rope_scaling=getattr(text_config, "rope_scaling", None),
+        rope_theta=getattr(text_config, "rope_theta", 1000000.0),
+        sliding_window=getattr(text_config, "sliding_window", None),
+        tie_word_embeddings=getattr(text_config, "tie_word_embeddings", True),
+        vocab_size=text_config.vocab_size,
+        head_dim=getattr(text_config, "head_dim", 128),
+        attention_dropout=getattr(text_config, "attention_dropout", 0.0),
+        attention_bias=getattr(text_config, "attention_bias", False),
+        hidden_act=getattr(text_config, "hidden_act", "silu"),
+        initializer_range=getattr(text_config, "initializer_range", 0.02),
         use_cache=True,
     )
+    print(f"  hidden_size={qwen3_config.hidden_size}, "
+          f"num_hidden_layers={qwen3_config.num_hidden_layers}, "
+          f"vocab_size={qwen3_config.vocab_size}")
 
     standalone = Qwen3ForCausalLM(qwen3_config)
     standalone.eval()
@@ -308,11 +347,13 @@ def step4_create_standalone_decoder(decoder_sd: dict, paths: dict):
     print(f"  Unexpected keys: {len(unexpected)} {unexpected}")
 
     # Quick sanity check
+    vocab_size = qwen3_config.vocab_size
     with torch.no_grad():
         dummy_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
         output = standalone(input_ids=dummy_ids)
-        assert output.logits.shape == (1, 5, 151936), (
-            f"Expected [1, 5, 151936], got {list(output.logits.shape)}"
+        expected_logits = (1, 5, vocab_size)
+        assert output.logits.shape == expected_logits, (
+            f"Expected {list(expected_logits)}, got {list(output.logits.shape)}"
         )
     print("  Forward pass sanity check: OK")
 
@@ -351,6 +392,7 @@ def step5_export_decoder_stateful(standalone_dir: str, paths: dict, model_id: st
         export=True,
         stateful=True,
         trust_remote_code=False,  # Standard Qwen3, no custom code needed
+        load_in_8bit=False,  # Prevent auto INT8_ASYM for >1B models (step 6b handles quantization)
     )
     ov_model.save_pretrained(export_dir)
     print(f"  Exported to: {export_dir}")
@@ -377,7 +419,7 @@ def step5_export_decoder_stateful(standalone_dir: str, paths: dict, model_id: st
 # Step 6 -- IR surgery: remove input_ids, add inputs_embeds
 # ============================================================================
 
-def step6_ir_surgery(paths: dict):
+def step6_ir_surgery(paths: dict, *, hidden_size: int = 1024):
     """Perform graph surgery on the stateful decoder IR.
 
     The NPUW_LLM plugin selects its main input by name priority:
@@ -386,7 +428,7 @@ def step6_ir_surgery(paths: dict):
 
     Surgery steps:
       1. Find the Gather node that consumes input_ids (the embedding lookup)
-      2. Create a new inputs_embeds Parameter with shape [1, ?, 1024]
+      2. Create a new inputs_embeds Parameter with shape [1, ?, hidden_size]
       3. Redirect all Gather consumers to read from inputs_embeds instead
       4. Disconnect input_ids from all its consumers (ShapeOf, Convert, etc.)
       5. Rebuild the Model excluding input_ids entirely
@@ -450,13 +492,12 @@ def step6_ir_surgery(paths: dict):
 
     # ---- Determine hidden_size from the Gather output --------------------
     # Gather output shape is typically [1, ?, hidden_size]
-    hidden_size = gather_shape[-1]
-    if hidden_size.is_dynamic:
-        hidden_size = 1024  # Qwen3-ASR-0.6B text decoder hidden_size
-        print(f"  Hidden size is dynamic, defaulting to {hidden_size}")
+    gather_hidden = gather_shape[-1]
+    if gather_hidden.is_dynamic:
+        print(f"  Hidden size is dynamic in IR, using passed value: {hidden_size}")
     else:
-        hidden_size = hidden_size.get_length()
-        print(f"  Hidden size: {hidden_size}")
+        hidden_size = gather_hidden.get_length()
+        print(f"  Hidden size from IR: {hidden_size}")
 
     # ---- Create new inputs_embeds Parameter ------------------------------
     inputs_embeds_param = opset.parameter(
@@ -563,6 +604,70 @@ def step6_ir_surgery(paths: dict):
 
 
 # ============================================================================
+# Step 6b -- Quantize decoder to INT4_SYM for >1B models
+# ============================================================================
+
+def step_quantize_decoder(paths: dict, *, hidden_size: int):
+    """Quantize decoder to INT4_SYM for >1B models (NPU requirement).
+
+    Models with hidden_size <= 1024 (i.e. 0.6B) stay FP16 because
+    small models on NPU are actually faster without quantization.
+    """
+    if hidden_size <= 1024:
+        print("=" * 60)
+        print("Step 6b: Skipping quantization (model <=1B, FP16 is optimal)")
+        print("=" * 60)
+        print()
+        return
+
+    print("=" * 60)
+    print("Step 6b: Quantizing decoder to INT4_SYM")
+    print("=" * 60)
+    elapsed = _timer()
+
+    import openvino as ov
+    import nncf
+
+    embeds_dir = paths["decoder_stateful_embeds_dir"]
+    xml_path = str(embeds_dir / "openvino_model.xml")
+    core = ov.Core()
+    model = core.read_model(xml_path)
+
+    print(f"  Source: {xml_path}")
+    print("  mode=INT4_SYM, group_size=128, ratio=1.0")
+    print("  This may take a few minutes...")
+
+    compressed = nncf.compress_weights(
+        model,
+        mode=nncf.CompressWeightsMode.INT4_SYM,
+        group_size=128,
+        ratio=1.0,
+    )
+
+    # Save to temp dir first, then replace (avoids bin file locking)
+    import shutil
+    temp_dir = embeds_dir / "_int4_temp"
+    temp_dir.mkdir(exist_ok=True)
+    temp_xml = str(temp_dir / "openvino_model.xml")
+    ov.save_model(compressed, temp_xml)
+
+    # Release model before replacing files
+    del model, compressed
+    _free_memory()
+
+    # Move quantized files back
+    for f in temp_dir.iterdir():
+        shutil.move(str(f), str(embeds_dir / f.name))
+    temp_dir.rmdir()
+
+    bin_path = xml_path.replace(".xml", ".bin")
+    bin_mb = os.path.getsize(bin_path) / 1024 / 1024
+    print(f"  Quantized and saved: {xml_path} (bin: {bin_mb:.1f} MB)")
+    print(f"  Time: {elapsed():.1f}s")
+    print()
+
+
+# ============================================================================
 # Step 7 -- Extract embed_tokens.npy
 # ============================================================================
 
@@ -649,7 +754,8 @@ def main():
     parser.add_argument(
         "--model-id",
         default="Qwen/Qwen3-ASR-0.6B",
-        help="HuggingFace model ID or local path (default: Qwen/Qwen3-ASR-0.6B)",
+        help="HuggingFace model ID or local path "
+             "(default: Qwen/Qwen3-ASR-0.6B, also supports Qwen/Qwen3-ASR-1.7B)",
     )
     parser.add_argument(
         "--qwen-asr-src",
@@ -660,31 +766,47 @@ def main():
     args = parser.parse_args()
 
     # Ensure qwen_asr package is importable.
-    # It lives in the Qwen3-ASR project repo, not in this project.
+    # A vendored copy lives in asr/scripts/qwen_asr/.
     qwen_asr_src = args.qwen_asr_src
     if qwen_asr_src is None:
-        # Try to infer: if model-id is a local dir like .../Qwen3-ASR/Qwen3-ASR-0.6B,
-        # then the parent (.../Qwen3-ASR) should contain qwen_asr/.
-        model_path = Path(args.model_id)
-        if model_path.is_dir():
-            candidate = model_path.parent
-            if (candidate / "qwen_asr").is_dir():
-                qwen_asr_src = str(candidate)
+        # Check vendored copy next to this script
+        scripts_dir = Path(__file__).resolve().parent
+        if (scripts_dir / "qwen_asr").is_dir():
+            qwen_asr_src = str(scripts_dir)
+        else:
+            # Try to infer from local model path
+            model_path = Path(args.model_id)
+            if model_path.is_dir():
+                candidate = model_path.parent
+                if (candidate / "qwen_asr").is_dir():
+                    qwen_asr_src = str(candidate)
     if qwen_asr_src and qwen_asr_src not in sys.path:
         sys.path.insert(0, qwen_asr_src)
         print(f"  Added to sys.path: {qwen_asr_src}")
 
-    # Project root = translatorle/ (asr/scripts/ → asr/ → translatorle/)
+    # Detect model name and output subdirectory from model_id
+    model_name = Path(args.model_id).name  # e.g. "Qwen3-ASR-1.7B"
+    if "1.7B" in args.model_id.upper():
+        output_subdir = "asr_1.7b"
+    else:
+        output_subdir = None  # flat layout for backward compat with 0.6B
+
+    # Project root = translatorle/ (asr/scripts/ -> asr/ -> translatorle/)
     project_root = Path(__file__).resolve().parent.parent.parent
-    paths = _resolve_paths(project_root)
+    paths = _resolve_paths(
+        project_root, output_subdir=output_subdir, model_name=model_name,
+    )
 
     print()
     print("=" * 60)
     print("  Qwen3-ASR Model Preparation for OpenVINO NPU")
     print("=" * 60)
     print(f"  Model ID:     {args.model_id}")
+    print(f"  Model name:   {model_name}")
     print(f"  Project root: {project_root}")
     print(f"  Output dir:   {paths['models_dir']}")
+    if output_subdir:
+        print(f"  Subdirectory: {output_subdir}")
     print("=" * 60)
     print()
 
@@ -694,8 +816,18 @@ def main():
     # Step 1: Load model
     model = step1_load_model(args.model_id)
 
+    # Auto-detect model dimensions from config
+    audio_config = model.config.thinker_config.audio_config
+    text_config = model.config.thinker_config.text_config
+    d_model = audio_config.d_model
+    hidden_size = text_config.hidden_size
+    print(f"  Auto-detected: d_model={d_model}, hidden_size={hidden_size}")
+    print(f"  Text decoder layers={text_config.num_hidden_layers}, "
+          f"vocab_size={text_config.vocab_size}")
+    print()
+
     # Step 2: Export encoder
-    step2_export_encoder(model, paths)
+    step2_export_encoder(model, paths, d_model=d_model, hidden_size=hidden_size)
 
     # Step 3: Extract decoder weights
     decoder_sd = step3_extract_decoder_weights(model)
@@ -704,7 +836,7 @@ def main():
     step7_extract_embeddings(model, paths)
 
     # Step 4: Create standalone decoder and save
-    standalone_dir = step4_create_standalone_decoder(decoder_sd, paths)
+    standalone_dir = step4_create_standalone_decoder(decoder_sd, paths, text_config)
 
     # Free original model memory
     del model, decoder_sd
@@ -719,7 +851,10 @@ def main():
     _free_memory()
 
     # Step 6: IR surgery
-    step6_ir_surgery(paths)
+    step6_ir_surgery(paths, hidden_size=hidden_size)
+
+    # Step 6b: Quantize decoder if >1B
+    step_quantize_decoder(paths, hidden_size=hidden_size)
 
     # Step 8: Copy tokenizer files
     step8_copy_tokenizer(args.model_id, paths)
