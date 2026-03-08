@@ -1,0 +1,20 @@
+# Models (large binary files, use prepare_asr_models.py to generate)
+models/
+
+# Test audio files
+*.wav
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# uv
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db

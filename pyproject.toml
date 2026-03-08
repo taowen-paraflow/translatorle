@@ -1,0 +1,30 @@
+[project]
+name = "translatorle"
+version = "0.1.0"
+description = "Offline translator with ASR + LLM + TTS"
+requires-python = ">=3.12"
+dependencies = [
+    # Core inference
+    "openvino>=2026.0.0",
+    "numpy",
+    "transformers>=4.50",
+    # Audio processing
+    "librosa",
+    # Model export (only needed for prepare_asr_models.py)
+    "torch",
+    "torchaudio",
+    "optimum[openvino]",
+    "nncf>=3.0",
+]
+
+[tool.uv]
+environments = ["sys_platform == 'win32'"]
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-xpu" }]
+torchaudio = [{ index = "pytorch-xpu" }]
