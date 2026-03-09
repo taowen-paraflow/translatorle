@@ -7,7 +7,7 @@ dependencies = [
     # Core inference
     "openvino>=2026.0.0",
     "numpy",
-    "transformers>=4.50",
+    "transformers>=4.49,<5",
     # Audio processing
     "librosa",
     # Model export (only needed for prepare_asr_models.py)

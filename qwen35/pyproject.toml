@@ -1,0 +1,23 @@
+[project]
+name = "qwen35-export"
+version = "0.1.0"
+description = "Qwen3.5 OpenVINO export & inference (standalone venv)"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "openvino>=2026.0.0",
+    "numpy",
+    "transformers>=5.0",
+    "torch",
+    "huggingface-hub",
+]
+
+[tool.uv]
+environments = ["sys_platform == 'win32'"]
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-xpu" }]

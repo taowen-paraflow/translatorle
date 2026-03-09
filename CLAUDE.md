@@ -25,10 +25,11 @@ powershell.exe -Command '$env:PYTHONIOENCODING="utf-8"; cd C:\Apps\translatorle;
 |------|------|
 | `asr/` | 流式语音识别（Qwen3-ASR 0.6B/1.7B） |
 | `hymt/` | 机器翻译（HY-MT1.5-1.8B） |
+| `qwen35/` | Qwen3.5 通用推理（GDN 混合架构，含 VL 视觉语言） |
 | `app/` | PySide6 桌面 GUI |
 | `models/` | OpenVINO IR 模型文件（不入 git） |
 
-各模块有独立的 CLAUDE.md，详见 `asr/CLAUDE.md`、`hymt/CLAUDE.md`、`app/CLAUDE.md`。
+各模块有独立的 CLAUDE.md，详见 `asr/CLAUDE.md`、`hymt/CLAUDE.md`、`app/CLAUDE.md`、`qwen35/CLAUDE.md`。
 
 ## 设备分配
 
