@@ -141,6 +141,7 @@ class Qwen35OVModel(GenerationMixin):
         tokenizer,
         embed_table: np.ndarray,
         device_name: str = "CPU",
+        ov_config: Optional[Dict[str, str]] = None,
     ):
         # GenerationMixin does not define __init__, but some downstream
         # helpers check for ``self.config`` / ``self.generation_config``.
@@ -154,6 +155,14 @@ class Qwen35OVModel(GenerationMixin):
         self._embed_table = embed_table
         self._device_name = device_name
 
+        # NPUW_LLM mode: KV cache is managed on-device by the NPUW_LLM engine.
+        # Attention mask must grow with each decode step (full context length).
+        self._is_npuw_llm = bool(
+            ov_config and ov_config.get("NPUW_LLM", "").upper() == "YES"
+        )
+        if self._is_npuw_llm:
+            logger.info("NPUW_LLM mode: attention_mask grows with context")
+
         # Position tracking for token-by-token generation.
         self._past_length: int = 0
 
@@ -162,6 +171,17 @@ class Qwen35OVModel(GenerationMixin):
         self._input_names: set = {
             inp.get_any_name() for inp in model.inputs
         }
+
+        # Detect whether the IR has static seq_len=1 (NPU Loop-free IR).
+        # If so, force token-by-token prefill regardless of device.
+        self._token_by_token = False
+        for inp in model.inputs:
+            if "inputs_embeds" in inp.get_any_name():
+                seq_dim = inp.get_partial_shape()[1]
+                if seq_dim.is_static and seq_dim.get_length() == 1:
+                    self._token_by_token = True
+                    logger.info("Detected static seq_len=1 IR — using token-by-token prefill")
+                break
 
         # Discover state variable names and classify them.
         self._conv_state_names: List[str] = []
@@ -199,12 +219,272 @@ class Qwen35OVModel(GenerationMixin):
             len(self._value_state_names),
         )
 
+        # Detect explicit (non-stateful) conv/recurrent Parameters.
+        # These exist when KV-only stateful is used (NPU mode): conv/recurrent
+        # are explicit I/O, not managed by NPUW_LLM.
+        # Sort by numeric suffix (not lexicographic) so index i matches layer i.
+        def _sort_by_suffix(names):
+            return sorted(names, key=lambda n: int(n.rsplit(".", 1)[1]))
+
+        self._explicit_conv_inputs: List[str] = _sort_by_suffix(
+            n for n in self._input_names if "cache_params.past.conv" in n
+        )
+        self._explicit_recurrent_inputs: List[str] = _sort_by_suffix(
+            n for n in self._input_names if "cache_params.past.recurrent" in n
+        )
+        # In NPUW_LLM mode, GDN states are managed on-device via passthrough
+        # copy (present→past).  Python must NOT feed/read them or it will
+        # overwrite the on-device state with stale data.
+        self._has_explicit_gdn_states = bool(
+            (self._explicit_conv_inputs or self._explicit_recurrent_inputs)
+            and not self._is_npuw_llm
+        )
+
+        # Matching output names for reading back updated states
+        self._output_names: set = set()
+        for out in model.outputs:
+            self._output_names.update(out.get_names())
+        self._explicit_conv_outputs: List[str] = _sort_by_suffix(
+            n for n in self._output_names if "cache_params.present.conv" in n
+        )
+        self._explicit_recurrent_outputs: List[str] = _sort_by_suffix(
+            n for n in self._output_names if "cache_params.present.recurrent" in n
+        )
+
+        # Detect hybrid mode: IR has gdn_intermediate outputs for CPU FP32 state update
+        self._gdn_intermediate_outputs: List[str] = sorted(
+            n for n in self._output_names if "gdn_intermediate" in n
+        )
+        self._is_hybrid = bool(self._gdn_intermediate_outputs) and self._has_explicit_gdn_states
+        if self._is_hybrid:
+            logger.info(
+                "Hybrid NPU+CPU mode: %d GDN intermediate outputs, "
+                "CPU FP32 state update enabled",
+                len(self._gdn_intermediate_outputs),
+            )
+
+        # Initialize GDN state tensors (zero-filled)
+        self._gdn_states: Dict[str, np.ndarray] = {}
+        if self._has_explicit_gdn_states:
+            self._init_gdn_states()
+            logger.info(
+                "Explicit GDN states: %d conv + %d recurrent Parameters",
+                len(self._explicit_conv_inputs),
+                len(self._explicit_recurrent_inputs),
+            )
+
+        # --- Static-cache mode detection (NPU all-explicit model) ---
+        # If there are no stateful variables AND we have explicit KV inputs,
+        # the model uses pre-allocated static KV cache buffers.
+        self._explicit_key_inputs: List[str] = _sort_by_suffix(
+            n for n in self._input_names if "cache_params.past.key" in n
+        )
+        self._explicit_value_inputs: List[str] = _sort_by_suffix(
+            n for n in self._input_names if "cache_params.past.value" in n
+        )
+        self._explicit_key_outputs: List[str] = _sort_by_suffix(
+            n for n in self._output_names if "cache_params.present.key" in n
+        )
+        self._explicit_value_outputs: List[str] = _sort_by_suffix(
+            n for n in self._output_names if "cache_params.present.value" in n
+        )
+        self._is_static_cache = bool(
+            num_state_vars == 0
+            and self._explicit_key_inputs
+            and self._explicit_value_inputs
+        )
+
+        if self._is_static_cache:
+            # Infer max_cache_len from KV input shape: [1, H, MAX_LEN, D]
+            kv_shape = model.input(self._explicit_key_inputs[0]).get_partial_shape()
+            self._max_cache_len = kv_shape[2].get_length()
+            self._kv_buffers: Dict[str, np.ndarray] = {}
+            self._init_kv_buffers()
+            logger.info(
+                "Static-cache mode: %d KV layers, max_cache_len=%d",
+                len(self._explicit_key_inputs),
+                self._max_cache_len,
+            )
+
         # generation_config -- try to load from model config, fall back to
         # a sensible default.
         try:
             self.generation_config = GenerationConfig.from_model_config(config)
         except Exception:
             self.generation_config = GenerationConfig()
+
+    # -----------------------------------------------------------------
+    # Explicit GDN state management (KV-only stateful mode)
+    # -----------------------------------------------------------------
+
+    def _init_gdn_states(self) -> None:
+        """Zero-initialize explicit GDN (conv/recurrent) state tensors."""
+        for name in self._explicit_conv_inputs + self._explicit_recurrent_inputs:
+            pshape = self._ov_model.input(name).get_partial_shape()
+            shape = [
+                dim.get_length() if dim.is_static else 1
+                for dim in pshape
+            ]
+            self._gdn_states[name] = np.zeros(shape, dtype=np.float32)
+
+        # FP32 shadow copies for hybrid mode
+        if self._is_hybrid:
+            self._fp32_recurrent_states: Dict[str, np.ndarray] = {}
+            for name in self._explicit_recurrent_inputs:
+                pshape = self._ov_model.input(name).get_partial_shape()
+                shape = [dim.get_length() if dim.is_static else 1 for dim in pshape]
+                self._fp32_recurrent_states[name] = np.zeros(shape, dtype=np.float32)
+
+    def _feed_gdn_states(self, inp: Dict[str, Any]) -> None:
+        """Add explicit GDN states to the input dict."""
+        for name in self._explicit_conv_inputs:
+            inp[name] = self._gdn_states[name]
+        for name in self._explicit_recurrent_inputs:
+            if self._is_hybrid:
+                # Feed FP32 shadow state -- NPU auto-converts to FP16
+                inp[name] = self._fp32_recurrent_states[name]
+            else:
+                inp[name] = self._gdn_states[name]
+
+    def _read_gdn_states(self) -> None:
+        """Read updated GDN states from model outputs after infer()."""
+        # Conv states: always read from NPU output (no accumulation issue)
+        for past_name, present_name in zip(
+            self._explicit_conv_inputs, self._explicit_conv_outputs
+        ):
+            self._gdn_states[past_name] = (
+                self._request.get_tensor(present_name).data.copy()
+            )
+
+        if self._is_hybrid:
+            # Hybrid mode: update FP32 shadow state using intermediates
+            self._cpu_fp32_state_update()
+        else:
+            # Normal mode: use NPU's state output directly
+            for past_name, present_name in zip(
+                self._explicit_recurrent_inputs, self._explicit_recurrent_outputs
+            ):
+                self._gdn_states[past_name] = (
+                    self._request.get_tensor(present_name).data.copy()
+                )
+
+    def _cpu_fp32_state_update(self) -> None:
+        """Update FP32 shadow recurrent states using GDN intermediates from NPU.
+
+        For each GDN layer i:
+          S = S * g_t + outer(k_t, delta_t)
+          where delta_t = (v_t - (S * k_t).sum(-2)) * beta_t
+
+        All computation in FP32. Intermediates from NPU are FP16-precision
+        but converted to FP32 for accumulation.
+        """
+        num_layers = len(self._explicit_recurrent_inputs)
+        for i in range(num_layers):
+            past_name = self._explicit_recurrent_inputs[i]
+            S = self._fp32_recurrent_states[past_name]  # [B, H, D_k, D_v] FP32
+
+            # Read intermediates from NPU output
+            g_t = self._request.get_tensor(
+                f"gdn_intermediate.{i}.g_t"
+            ).data.copy().astype(np.float32)
+            k_t = self._request.get_tensor(
+                f"gdn_intermediate.{i}.k_t"
+            ).data.copy().astype(np.float32)
+            v_t = self._request.get_tensor(
+                f"gdn_intermediate.{i}.v_t"
+            ).data.copy().astype(np.float32)
+            beta_t = self._request.get_tensor(
+                f"gdn_intermediate.{i}.beta_t"
+            ).data.copy().astype(np.float32)
+
+            # g_t: [B, H, 1, 1] -- decay factor (already exp'd)
+            # k_t: [B, H, D_k]
+            # v_t: [B, H, D_v]
+            # beta_t: [B, H, 1]
+
+            # Decay
+            S = S * g_t  # [B, H, D_k, D_v] * [B, H, 1, 1]
+
+            # Read: mem = sum(S * k, axis=-2) -- matmul S @ k
+            # S: [B, H, D_k, D_v], k_t: [B, H, D_k]
+            # mem: [B, H, D_v]
+            mem = np.einsum('bhkv,bhk->bhv', S, k_t)
+
+            # Delta
+            delta = (v_t - mem) * beta_t  # [B, H, D_v]
+
+            # Write: S += outer(k, delta)
+            # k_t: [B, H, D_k], delta: [B, H, D_v]
+            S = S + np.einsum('bhk,bhv->bhkv', k_t, delta)
+
+            self._fp32_recurrent_states[past_name] = S
+
+    # -----------------------------------------------------------------
+    # Static KV cache management (all-explicit NPU model)
+    # -----------------------------------------------------------------
+
+    def _init_kv_buffers(self) -> None:
+        """Zero-initialize the static KV cache buffers."""
+        for name in self._explicit_key_inputs + self._explicit_value_inputs:
+            pshape = self._ov_model.input(name).get_partial_shape()
+            shape = [dim.get_length() for dim in pshape]
+            self._kv_buffers[name] = np.zeros(shape, dtype=np.float32)
+
+    def _feed_kv_buffers(self, inp: Dict[str, Any]) -> None:
+        """Add KV cache buffers to the input dict."""
+        for name in self._explicit_key_inputs + self._explicit_value_inputs:
+            inp[name] = self._kv_buffers[name]
+
+    def _read_kv_outputs(self) -> None:
+        """Read new K/V from outputs and write into the buffer at _past_length."""
+        pos = self._past_length  # Position to write the new entry
+        if pos >= self._max_cache_len:
+            # Buffer full — shift left by 1 to make room
+            for name in self._explicit_key_inputs + self._explicit_value_inputs:
+                self._kv_buffers[name][:, :, :-1, :] = (
+                    self._kv_buffers[name][:, :, 1:, :]
+                )
+            pos = self._max_cache_len - 1
+
+        for past_name, present_name in zip(
+            self._explicit_key_inputs, self._explicit_key_outputs
+        ):
+            new_kv = self._request.get_tensor(present_name).data.copy()
+            self._kv_buffers[past_name][:, :, pos:pos+1, :] = new_kv
+
+        for past_name, present_name in zip(
+            self._explicit_value_inputs, self._explicit_value_outputs
+        ):
+            new_kv = self._request.get_tensor(present_name).data.copy()
+            self._kv_buffers[past_name][:, :, pos:pos+1, :] = new_kv
+
+    def _build_4d_mask(self) -> np.ndarray:
+        """Build 4D float attention mask for static-cache model.
+
+        Shape: [1, 1, 1, max_cache_len + 1]
+        The mask covers the concatenated KV: [past_buffer(max_len) | current(1)]
+
+        At step t (0-indexed, _past_length tokens already processed):
+        - Positions 0..t-1: 0.0 (attend to valid past tokens)
+        - Positions t..max_len-1: -inf (masked, unused buffer slots)
+        - Position max_len: 0.0 (attend to current token)
+        """
+        total_len = self._max_cache_len + 1
+        mask = np.full((1, 1, 1, total_len), -np.inf, dtype=np.float32)
+        # Unmask valid past positions
+        t = min(self._past_length, self._max_cache_len)
+        if t > 0:
+            mask[0, 0, 0, :t] = 0.0
+        # Unmask current token position (always last in concatenated KV)
+        mask[0, 0, 0, -1] = 0.0
+        return mask
+
+    def _reset_static_cache(self) -> None:
+        """Reset all static-cache state for a new generation."""
+        self._past_length = 0
+        if self._has_explicit_gdn_states:
+            self._init_gdn_states()
+        self._init_kv_buffers()
 
     # -----------------------------------------------------------------
     # from_pretrained
@@ -242,6 +522,22 @@ class Qwen35OVModel(GenerationMixin):
         ov_model = core.read_model(str(xml_path))
 
         compile_props = ov_config or {}
+        if device == "NPU" and not compile_props:
+            from .config import NPU_OV_CONFIG
+            compile_props = NPU_OV_CONFIG
+            logger.info("NPU device: applying default NPUW config")
+
+        # The IR is saved with FP16 compression, so outputs are f16.
+        # CPU auto-promotes to f32, but GPU and NPU do not — add a
+        # PrePostProcessor pass to convert outputs to f32 explicitly.
+        if device in ("NPU", "GPU"):
+            from openvino.preprocess import PrePostProcessor
+            ppp = PrePostProcessor(ov_model)
+            for i in range(len(ov_model.outputs)):
+                ppp.output(i).tensor().set_element_type(ov.Type.f32)
+            ov_model = ppp.build()
+
+        logger.info("Compiling model on %s ...", device)
         compiled = core.compile_model(ov_model, device, compile_props)
         request = compiled.create_infer_request()
 
@@ -272,6 +568,7 @@ class Qwen35OVModel(GenerationMixin):
             tokenizer=tokenizer,
             embed_table=embed_table,
             device_name=device,
+            ov_config=compile_props,
         )
 
     # -----------------------------------------------------------------
@@ -299,22 +596,57 @@ class Qwen35OVModel(GenerationMixin):
     ) -> Qwen35Output:
         """Run a single forward pass through the OpenVINO model.
 
-        * **Prefill** (``seq_len > 1``): batch prefill -- sends all tokens
-          in a single infer() call.  The GDN recurrence is handled by an
-          OpenVINO Loop node that iterates over the sequence internally.
-        * **Decode** (``seq_len == 1``): single-token decode step.
-
-        Both modes provide ``attention_mask`` matching the current input
-        length.  The model handles causal masking and past context via
-        its stateful KV/conv/recurrent variables.
+        Three modes:
+        * **Static-cache** (NPU all-explicit): all states are explicit I/O.
+          Python manages KV buffers and 4D attention mask.
+        * **Token-by-token prefill** (stateful + explicit GDN): seq_len=1
+          per infer() call, stateful KV + explicit GDN states.
+        * **Batch prefill** (CPU/GPU stateful): sends all tokens in one call.
         """
         if input_ids is None:
             raise ValueError("input_ids must be provided")
 
         batch_size, seq_len = input_ids.shape
 
-        if seq_len > 1:
-            # ----- prefill: batch infer ------------------------------------
+        if self._is_static_cache:
+            # ----- static-cache mode (NPU all-explicit) --------------------
+            return self._forward_static_cache(input_ids, cache_params)
+
+        if seq_len > 1 and self._token_by_token:
+            # ----- token-by-token prefill (stateful KV + explicit GDN) -----
+            if cache_params is None:
+                self._request.reset_state()
+                self._past_length = 0
+                if self._has_explicit_gdn_states:
+                    self._init_gdn_states()
+
+            ids_np = input_ids.numpy().astype(np.int64)
+            for i in range(seq_len):
+                single_embed = self._embed_table[ids_np[:, i:i+1]].astype(np.float32)
+                inp: Dict[str, Any] = {"inputs_embeds": single_embed}
+                if "attention_mask" in self._input_names:
+                    if self._is_npuw_llm:
+                        # NPUW_LLM chunk prefill: mask covers past + current
+                        inp["attention_mask"] = np.ones(
+                            (batch_size, self._past_length + 1), dtype=np.int64
+                        )
+                    else:
+                        inp["attention_mask"] = np.ones((batch_size, 1), dtype=np.int64)
+                if "position_ids" in self._input_names:
+                    inp["position_ids"] = np.full(
+                        (3, batch_size, 1), self._past_length, dtype=np.int64,
+                    )
+                if "beam_idx" in self._input_names:
+                    inp["beam_idx"] = np.zeros(batch_size, dtype=np.int64)
+                if self._has_explicit_gdn_states:
+                    self._feed_gdn_states(inp)
+                self._request.infer(inp)
+                if self._has_explicit_gdn_states:
+                    self._read_gdn_states()
+                self._past_length += 1
+
+        elif seq_len > 1:
+            # ----- prefill: batch infer (CPU/GPU) --------------------------
             if cache_params is None:
                 self._request.reset_state()
                 self._past_length = 0
@@ -329,14 +661,17 @@ class Qwen35OVModel(GenerationMixin):
                 inp["attention_mask"] = np.ones((batch_size, seq_len), dtype=np.int64)
 
             if "position_ids" in self._input_names:
-                # Text-only: all 3 mRoPE dims are identical (sequential)
                 positions = np.arange(self._past_length, self._past_length + seq_len, dtype=np.int64)
                 inp["position_ids"] = np.tile(positions[np.newaxis, np.newaxis, :], (3, batch_size, 1))
 
             if "beam_idx" in self._input_names:
                 inp["beam_idx"] = np.zeros(batch_size, dtype=np.int64)
 
+            if self._has_explicit_gdn_states:
+                self._feed_gdn_states(inp)
             self._request.infer(inp)
+            if self._has_explicit_gdn_states:
+                self._read_gdn_states()
             self._past_length = seq_len
         else:
             # ----- decode: single token ------------------------------------
@@ -347,7 +682,13 @@ class Qwen35OVModel(GenerationMixin):
             }
 
             if "attention_mask" in self._input_names:
-                inp["attention_mask"] = np.ones((batch_size, 1), dtype=np.int64)
+                if self._is_npuw_llm:
+                    # NPUW_LLM: mask covers full context (past + current)
+                    inp["attention_mask"] = np.ones(
+                        (batch_size, self._past_length + 1), dtype=np.int64
+                    )
+                else:
+                    inp["attention_mask"] = np.ones((batch_size, 1), dtype=np.int64)
 
             if "position_ids" in self._input_names:
                 pos = self._past_length
@@ -356,7 +697,11 @@ class Qwen35OVModel(GenerationMixin):
             if "beam_idx" in self._input_names:
                 inp["beam_idx"] = np.zeros(batch_size, dtype=np.int64)
 
+            if self._has_explicit_gdn_states:
+                self._feed_gdn_states(inp)
             self._request.infer(inp)
+            if self._has_explicit_gdn_states:
+                self._read_gdn_states()
             self._past_length += 1
 
         # --- read logits ---------------------------------------------------
@@ -370,6 +715,54 @@ class Qwen35OVModel(GenerationMixin):
         )
 
         return Qwen35Output(logits=logits, cache_params=cache_state)
+
+    def _forward_static_cache(
+        self,
+        input_ids: torch.LongTensor,
+        cache_params: Optional[Qwen35CacheState],
+    ) -> Qwen35Output:
+        """Forward pass for NPU all-explicit static-cache model.
+
+        All states (KV cache + GDN conv/recurrent) are explicit I/O.
+        KV cache is a pre-allocated buffer; Python manages position tracking,
+        4D attention mask, and buffer updates.
+        """
+        batch_size, seq_len = input_ids.shape
+        ids_np = input_ids.numpy().astype(np.int64)
+
+        if cache_params is None and self._past_length > 0:
+            # New generation — reset everything
+            self._reset_static_cache()
+
+        for i in range(seq_len):
+            token_id = ids_np[:, i:i+1]
+            embed = self._embed_table[token_id].astype(np.float32)
+
+            inp: Dict[str, Any] = {
+                "inputs_embeds": embed,
+                "attention_mask": self._build_4d_mask(),
+                "position_ids": np.full(
+                    (3, batch_size, 1),
+                    min(self._past_length, self._max_cache_len - 1),
+                    dtype=np.int64,
+                ),
+            }
+
+            # Feed all explicit states
+            self._feed_gdn_states(inp)
+            self._feed_kv_buffers(inp)
+
+            self._request.infer(inp)
+
+            # Read back updated states
+            self._read_gdn_states()
+            self._read_kv_outputs()
+            self._past_length += 1
+
+        logits = torch.from_numpy(
+            self._request.get_tensor("logits").data.copy()
+        )
+        return Qwen35Output(logits=logits, cache_params=Qwen35CacheState())
 
     # -----------------------------------------------------------------
     # generate() plumbing
@@ -442,6 +835,8 @@ class Qwen35OVModel(GenerationMixin):
         """Manually reset all OV states and the position counter."""
         self._request.reset_state()
         self._past_length = 0
+        if self._has_explicit_gdn_states:
+            self._init_gdn_states()
 
     def __repr__(self) -> str:
         model_type = getattr(self.config, "model_type", "unknown")
@@ -507,7 +902,24 @@ class Qwen35VLModel:
         compile_props = ov_config or {}
         if not compile_props and device in ("CPU", "GPU"):
             compile_props = {"PERFORMANCE_HINT": "LATENCY"}
-        self._compiled = core.compile_model(decoder_xml, device, compile_props)
+        elif not compile_props and device == "NPU":
+            from .config import NPU_OV_CONFIG
+            compile_props = NPU_OV_CONFIG
+            logger.info("NPU device: applying default NPUW config")
+
+        ov_model = core.read_model(decoder_xml)
+
+        # FP16 IR outputs need explicit f32 conversion on GPU/NPU
+        # (CPU auto-promotes, GPU and NPU do not).
+        if device in ("NPU", "GPU"):
+            from openvino.preprocess import PrePostProcessor
+            ppp = PrePostProcessor(ov_model)
+            for i in range(len(ov_model.outputs)):
+                ppp.output(i).tensor().set_element_type(ov.Type.f32)
+            ov_model = ppp.build()
+
+        logger.info("Compiling VL decoder on %s ...", device)
+        self._compiled = core.compile_model(ov_model, device, compile_props)
         self._request = self._compiled.create_infer_request()
         self._device_name = device
 
@@ -528,6 +940,36 @@ class Qwen35VLModel:
             self._embed_table.shape,
             self._embed_table.dtype,
         )
+
+        # Detect explicit GDN states (KV-only stateful mode for NPU)
+        self._explicit_conv_inputs: List[str] = sorted(
+            n for n in self._input_names if "cache_params.past.conv" in n
+        )
+        self._explicit_recurrent_inputs: List[str] = sorted(
+            n for n in self._input_names if "cache_params.past.recurrent" in n
+        )
+        self._has_explicit_gdn_states = bool(
+            self._explicit_conv_inputs or self._explicit_recurrent_inputs
+        )
+
+        _output_names: set = set()
+        for out in self._compiled.outputs:
+            _output_names.update(out.get_names())
+        self._explicit_conv_outputs: List[str] = sorted(
+            n for n in _output_names if "cache_params.present.conv" in n
+        )
+        self._explicit_recurrent_outputs: List[str] = sorted(
+            n for n in _output_names if "cache_params.present.recurrent" in n
+        )
+
+        self._gdn_states: Dict[str, np.ndarray] = {}
+        if self._has_explicit_gdn_states:
+            self._vl_init_gdn_states()
+            logger.info(
+                "VL explicit GDN states: %d conv + %d recurrent",
+                len(self._explicit_conv_inputs),
+                len(self._explicit_recurrent_inputs),
+            )
 
         # --- Vision encoder ---
         self._vision_encoder = OVVisionEncoder(vision_encoder_xml, device=device)
@@ -555,6 +997,36 @@ class Qwen35VLModel:
         self._image_token_id = _IMAGE_TOKEN_ID
         self._vision_start_id = _VISION_START_ID
         self._vision_end_id = _VISION_END_ID
+
+    # -----------------------------------------------------------------
+    # Explicit GDN state management (KV-only stateful mode)
+    # -----------------------------------------------------------------
+
+    def _vl_init_gdn_states(self) -> None:
+        """Zero-initialize explicit GDN state tensors."""
+        for name in self._explicit_conv_inputs + self._explicit_recurrent_inputs:
+            pshape = self._compiled.input(name).get_partial_shape()
+            shape = [
+                dim.get_length() if dim.is_static else 1
+                for dim in pshape
+            ]
+            self._gdn_states[name] = np.zeros(shape, dtype=np.float32)
+
+    def _vl_feed_gdn_states(self, feed: Dict[str, Any]) -> None:
+        """Add explicit GDN states to the feed dict."""
+        for name in self._explicit_conv_inputs + self._explicit_recurrent_inputs:
+            feed[name] = self._gdn_states[name]
+
+    def _vl_read_gdn_states(self) -> None:
+        """Read updated GDN states from model outputs after infer()."""
+        for past_name, present_name in zip(
+            self._explicit_conv_inputs, self._explicit_conv_outputs
+        ):
+            self._gdn_states[past_name] = self._request.get_tensor(present_name).data.copy()
+        for past_name, present_name in zip(
+            self._explicit_recurrent_inputs, self._explicit_recurrent_outputs
+        ):
+            self._gdn_states[past_name] = self._request.get_tensor(present_name).data.copy()
 
     @classmethod
     def from_pretrained(
@@ -843,16 +1315,18 @@ class Qwen35VLModel:
         self._request.reset_state()
         self._past_len = 0
         self._rope_delta = 0
+        if self._has_explicit_gdn_states:
+            self._vl_init_gdn_states()
 
     def prefill(
         self,
         inputs_embeds: np.ndarray,
         position_ids: Optional[np.ndarray] = None,
     ) -> int:
-        """Batch prefill: sends the entire prompt in a single infer() call.
+        """Prefill the prompt.
 
-        The GDN recurrence is handled by an OpenVINO Loop node that
-        iterates over the sequence dimension internally.
+        On CPU/GPU: batch prefill (single infer() call, Loop node handles GDN).
+        On NPU: token-by-token prefill (no Loop node in NPU IR).
 
         Args:
             inputs_embeds: Shape [seq_len, hidden_size] (no batch dim).
@@ -864,28 +1338,56 @@ class Qwen35VLModel:
         """
         seq_len = inputs_embeds.shape[0]
         self._request.reset_state()
+        if self._has_explicit_gdn_states:
+            self._vl_init_gdn_states()
 
-        # [seq_len, hidden_size] -> [1, seq_len, hidden_size]
-        embeds_batch = inputs_embeds[np.newaxis, :, :].astype(np.float32)
-        feed: Dict[str, Any] = {"inputs_embeds": embeds_batch}
+        if self._device_name == "NPU":
+            # ----- NPU: token-by-token prefill ----------------------------
+            embeds_f32 = inputs_embeds.astype(np.float32)
+            for i in range(seq_len):
+                token_embed = embeds_f32[np.newaxis, i:i+1, :]  # [1, 1, hidden]
+                feed: Dict[str, Any] = {"inputs_embeds": token_embed}
+                if "attention_mask" in self._input_names:
+                    feed["attention_mask"] = np.ones((1, 1), dtype=np.int64)
+                if "position_ids" in self._input_names:
+                    if position_ids is not None:
+                        # Use the per-token position from the full position_ids
+                        feed["position_ids"] = position_ids[:, :, i:i+1]
+                    else:
+                        feed["position_ids"] = np.full((3, 1, 1), i, dtype=np.int64)
+                if "beam_idx" in self._input_names:
+                    feed["beam_idx"] = np.array([0], dtype=np.int32)
+                if self._has_explicit_gdn_states:
+                    self._vl_feed_gdn_states(feed)
+                self._request.infer(feed)
+                if self._has_explicit_gdn_states:
+                    self._vl_read_gdn_states()
+            self._past_len = seq_len
+        else:
+            # ----- CPU/GPU: batch prefill ---------------------------------
+            embeds_batch = inputs_embeds[np.newaxis, :, :].astype(np.float32)
+            feed: Dict[str, Any] = {"inputs_embeds": embeds_batch}
 
-        if "attention_mask" in self._input_names:
-            feed["attention_mask"] = np.ones((1, seq_len), dtype=np.int64)
+            if "attention_mask" in self._input_names:
+                feed["attention_mask"] = np.ones((1, seq_len), dtype=np.int64)
 
-        if "position_ids" in self._input_names:
-            if position_ids is not None:
-                feed["position_ids"] = position_ids
-            else:
-                # Fallback: sequential positions (text-only)
-                positions = np.arange(seq_len, dtype=np.int64)
-                feed["position_ids"] = np.tile(positions[np.newaxis, np.newaxis, :], (3, 1, 1))
+            if "position_ids" in self._input_names:
+                if position_ids is not None:
+                    feed["position_ids"] = position_ids
+                else:
+                    positions = np.arange(seq_len, dtype=np.int64)
+                    feed["position_ids"] = np.tile(positions[np.newaxis, np.newaxis, :], (3, 1, 1))
 
-        if "beam_idx" in self._input_names:
-            feed["beam_idx"] = np.array([0], dtype=np.int32)
+            if "beam_idx" in self._input_names:
+                feed["beam_idx"] = np.array([0], dtype=np.int32)
 
-        self._request.infer(feed)
+            if self._has_explicit_gdn_states:
+                self._vl_feed_gdn_states(feed)
+            self._request.infer(feed)
+            if self._has_explicit_gdn_states:
+                self._vl_read_gdn_states()
+            self._past_len = seq_len
 
-        self._past_len = seq_len
         logits = self._request.get_output_tensor(0).data
         return int(np.argmax(logits[0, -1, :]))
 
@@ -917,7 +1419,11 @@ class Qwen35VLModel:
         if "beam_idx" in self._input_names:
             feed["beam_idx"] = np.array([0], dtype=np.int32)
 
+        if self._has_explicit_gdn_states:
+            self._vl_feed_gdn_states(feed)
         self._request.infer(feed)
+        if self._has_explicit_gdn_states:
+            self._vl_read_gdn_states()
         self._past_len += 1
 
         logits = self._request.get_output_tensor(0).data
@@ -993,4 +1499,414 @@ class Qwen35VLModel:
             f"Qwen35VLModel(device={self._device_name!r}, "
             f"embed_table={self._embed_table.shape}, "
             f"decoder_inputs={sorted(self._input_names)})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Multi-subgraph model (6 subgraphs x 4 layers, FP32 between subgraphs)
+# ---------------------------------------------------------------------------
+
+
+class Qwen35MultiSubgraphModel(GenerationMixin):
+    """Multi-subgraph NPU inference for Qwen3.5 with FP32 inter-subgraph precision.
+
+    Loads 6 subgraph IRs (each covering 4 layers), chains them together with
+    FP32 hidden_states between subgraphs. Each subgraph runs on NPU in FP16,
+    but hidden_states are read back to CPU as FP32 between subgraphs, limiting
+    FP16 error accumulation to 4 layers instead of 24.
+
+    GDN recurrent states are maintained as FP32 shadow copies on CPU, updated
+    using intermediates from NPU (same as Qwen35OVModel hybrid mode).
+    """
+
+    main_input_name = "input_ids"
+    _supports_cache_class = False
+    _is_stateful = True
+
+    def __init__(
+        self,
+        subgraph_models: List[ov.Model],
+        subgraph_requests: List[ov.InferRequest],
+        config,
+        tokenizer,
+        embed_table: np.ndarray,
+        max_cache_len: int = 256,
+    ):
+        super().__init__()
+
+        self.config = config
+        self.tokenizer = tokenizer
+        self._embed_table = embed_table
+        self._num_subgraphs = len(subgraph_models)
+        self._subgraph_models = subgraph_models
+        self._subgraph_requests = subgraph_requests
+        self._max_cache_len = max_cache_len
+        self._past_length: int = 0
+
+        # Discover input/output names per subgraph
+        self._sub_input_names: List[set] = []
+        self._sub_output_names: List[set] = []
+        for m in subgraph_models:
+            inp_names = set()
+            for inp in m.inputs:
+                inp_names.update(inp.get_names())
+            self._sub_input_names.append(inp_names)
+            out_names = set()
+            for out in m.outputs:
+                out_names.update(out.get_names())
+            self._sub_output_names.append(out_names)
+
+        # Per-subgraph state: conv, recurrent (FP32 shadow), KV buffers
+        # Each subgraph has 3 conv + 3 recurrent + 1 key + 1 value
+        self._conv_states: List[Dict[str, np.ndarray]] = []
+        self._fp32_recurrent_states: List[Dict[str, np.ndarray]] = []
+        self._kv_buffers: List[Dict[str, np.ndarray]] = []
+
+        for si in range(self._num_subgraphs):
+            conv_dict = {}
+            rec_dict = {}
+            kv_dict = {}
+            model = subgraph_models[si]
+            for inp in model.inputs:
+                name = inp.get_any_name()
+                pshape = inp.get_partial_shape()
+                shape = [dim.get_length() if dim.is_static else 1 for dim in pshape]
+                if "cache_params.past.conv" in name:
+                    conv_dict[name] = np.zeros(shape, dtype=np.float32)
+                elif "cache_params.past.recurrent" in name:
+                    rec_dict[name] = np.zeros(shape, dtype=np.float32)
+                elif "cache_params.past.key" in name or "cache_params.past.value" in name:
+                    kv_dict[name] = np.zeros(shape, dtype=np.float32)
+            self._conv_states.append(conv_dict)
+            self._fp32_recurrent_states.append(rec_dict)
+            self._kv_buffers.append(kv_dict)
+
+        # generation_config
+        try:
+            self.generation_config = GenerationConfig.from_model_config(config)
+        except Exception:
+            self.generation_config = GenerationConfig()
+
+        logger.info(
+            "Qwen35MultiSubgraphModel: %d subgraphs, max_cache_len=%d",
+            self._num_subgraphs, max_cache_len,
+        )
+
+    # -----------------------------------------------------------------
+    # Factory
+    # -----------------------------------------------------------------
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_path: Union[str, Path],
+        device: str = "NPU",
+        ov_config: Optional[Dict[str, str]] = None,
+    ) -> "Qwen35MultiSubgraphModel":
+        """Load multi-subgraph IRs from a directory."""
+        model_path = Path(model_path)
+        core = ov.Core()
+
+        # Find all subgraph files
+        subgraph_files = sorted(model_path.glob("subgraph_*.xml"))
+        if not subgraph_files:
+            raise FileNotFoundError(f"No subgraph_*.xml files in {model_path}")
+
+        num_subs = len(subgraph_files)
+        logger.info("Loading %d subgraph IRs from %s ...", num_subs, model_path)
+
+        subgraph_models = []
+        subgraph_requests = []
+
+        compile_props = ov_config or {}
+        if device == "NPU" and not compile_props:
+            from .config import MULTISUB_OV_CONFIG
+            compile_props = MULTISUB_OV_CONFIG
+
+        for i, xml_path in enumerate(subgraph_files):
+            logger.info("  Loading subgraph %d: %s", i, xml_path.name)
+            ov_model = core.read_model(str(xml_path))
+
+            # Add F32 output conversion for NPU/GPU
+            if device in ("NPU", "GPU"):
+                from openvino.preprocess import PrePostProcessor
+                ppp = PrePostProcessor(ov_model)
+                for j in range(len(ov_model.outputs)):
+                    ppp.output(j).tensor().set_element_type(ov.Type.f32)
+                ov_model = ppp.build()
+
+            logger.info("  Compiling subgraph %d on %s ...", i, device)
+            compiled = core.compile_model(ov_model, device, compile_props)
+            request = compiled.create_infer_request()
+            subgraph_models.append(ov_model)
+            subgraph_requests.append(request)
+
+        # Load config and tokenizer
+        try:
+            config = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True)
+        except (ValueError, KeyError):
+            import json
+            with open(model_path / "config.json") as f:
+                cfg_dict = json.load(f)
+            from transformers import PretrainedConfig
+            config = PretrainedConfig(**cfg_dict)
+
+        tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
+
+        embed_path = model_path / "embed_tokens.npy"
+        if embed_path.exists():
+            embed_table = np.load(str(embed_path))
+        else:
+            raise FileNotFoundError(f"Cannot find embed_tokens.npy at {embed_path}")
+
+        # Infer max_cache_len from first subgraph's KV input shape
+        max_cache_len = 256
+        for inp in subgraph_models[0].inputs:
+            name = inp.get_any_name()
+            if "cache_params.past.key" in name:
+                max_cache_len = inp.get_partial_shape()[2].get_length()
+                break
+
+        return cls(
+            subgraph_models=subgraph_models,
+            subgraph_requests=subgraph_requests,
+            config=config,
+            tokenizer=tokenizer,
+            embed_table=embed_table,
+            max_cache_len=max_cache_len,
+        )
+
+    # -----------------------------------------------------------------
+    # Properties required by GenerationMixin
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def can_generate() -> bool:
+        return True
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cpu")
+
+    # -----------------------------------------------------------------
+    # State management
+    # -----------------------------------------------------------------
+
+    def _reset_states(self) -> None:
+        """Reset all states for a new generation."""
+        self._past_length = 0
+        for si in range(self._num_subgraphs):
+            for name in self._conv_states[si]:
+                self._conv_states[si][name] = np.zeros_like(self._conv_states[si][name])
+            for name in self._fp32_recurrent_states[si]:
+                self._fp32_recurrent_states[si][name] = np.zeros_like(
+                    self._fp32_recurrent_states[si][name]
+                )
+            for name in self._kv_buffers[si]:
+                self._kv_buffers[si][name] = np.zeros_like(self._kv_buffers[si][name])
+
+    def _build_4d_mask(self) -> np.ndarray:
+        """Build 4D float attention mask for static-cache subgraphs."""
+        total_len = self._max_cache_len + 1
+        mask = np.full((1, 1, 1, total_len), -np.inf, dtype=np.float32)
+        t = min(self._past_length, self._max_cache_len)
+        if t > 0:
+            mask[0, 0, 0, :t] = 0.0
+        mask[0, 0, 0, -1] = 0.0
+        return mask
+
+    def _cpu_fp32_state_update(self, sub_idx: int) -> None:
+        """Update FP32 shadow recurrent states for a subgraph using GDN intermediates."""
+        request = self._subgraph_requests[sub_idx]
+        out_names = self._sub_output_names[sub_idx]
+
+        # Find recurrent input names for this subgraph (sorted by index)
+        rec_names = sorted(
+            self._fp32_recurrent_states[sub_idx].keys(),
+            key=lambda n: int(n.rsplit(".", 1)[1])
+        )
+
+        for i, past_name in enumerate(rec_names):
+            S = self._fp32_recurrent_states[sub_idx][past_name]  # [B, H, D_k, D_v]
+
+            g_t = request.get_tensor(
+                f"gdn_intermediate.{i}.g_t"
+            ).data.copy().astype(np.float32)
+            k_t = request.get_tensor(
+                f"gdn_intermediate.{i}.k_t"
+            ).data.copy().astype(np.float32)
+            v_t = request.get_tensor(
+                f"gdn_intermediate.{i}.v_t"
+            ).data.copy().astype(np.float32)
+            beta_t = request.get_tensor(
+                f"gdn_intermediate.{i}.beta_t"
+            ).data.copy().astype(np.float32)
+
+            # Decay
+            S = S * g_t
+
+            # Read
+            mem = np.einsum('bhkv,bhk->bhv', S, k_t)
+
+            # Delta
+            delta = (v_t - mem) * beta_t
+
+            # Write
+            S = S + np.einsum('bhk,bhv->bhkv', k_t, delta)
+
+            self._fp32_recurrent_states[sub_idx][past_name] = S
+
+    def _read_kv_outputs(self, sub_idx: int) -> None:
+        """Read new KV from subgraph outputs and write into buffers."""
+        request = self._subgraph_requests[sub_idx]
+        pos = self._past_length
+        if pos >= self._max_cache_len:
+            # Buffer full - shift left
+            for name in self._kv_buffers[sub_idx]:
+                self._kv_buffers[sub_idx][name][:, :, :-1, :] = (
+                    self._kv_buffers[sub_idx][name][:, :, 1:, :]
+                )
+            pos = self._max_cache_len - 1
+
+        kv_dict = self._kv_buffers[sub_idx]
+        for past_name in sorted(kv_dict.keys()):
+            # Derive present name: cache_params.past.key.0 -> cache_params.present.key.0
+            present_name = past_name.replace(".past.", ".present.")
+            new_kv = request.get_tensor(present_name).data.copy()
+            kv_dict[past_name][:, :, pos:pos+1, :] = new_kv
+
+    # -----------------------------------------------------------------
+    # forward
+    # -----------------------------------------------------------------
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+        cache_params: Optional[Qwen35CacheState] = None,
+        **kwargs,
+    ) -> Qwen35Output:
+        """Run a single forward pass through all 6 subgraphs."""
+        if input_ids is None:
+            raise ValueError("input_ids must be provided")
+
+        batch_size, seq_len = input_ids.shape
+        ids_np = input_ids.numpy().astype(np.int64)
+
+        if cache_params is None and self._past_length > 0:
+            self._reset_states()
+
+        for token_pos in range(seq_len):
+            token_id = ids_np[:, token_pos:token_pos+1]
+            # Embedding lookup (FP32, CPU)
+            hidden = self._embed_table[token_id].astype(np.float32)  # [1, 1, 1024]
+
+            mask = self._build_4d_mask()
+            pos_ids = np.full(
+                (3, batch_size, 1),
+                min(self._past_length, self._max_cache_len - 1),
+                dtype=np.int64,
+            )
+
+            for si in range(self._num_subgraphs):
+                # Build input dict for this subgraph
+                inp: Dict[str, Any] = {
+                    "hidden_states": hidden,
+                    "attention_mask": mask,
+                    "position_ids": pos_ids,
+                }
+
+                # Feed conv states
+                for name, state in self._conv_states[si].items():
+                    inp[name] = state
+
+                # Feed FP32 recurrent states (NPU auto-truncates to FP16)
+                for name, state in self._fp32_recurrent_states[si].items():
+                    inp[name] = state
+
+                # Feed KV buffers
+                for name, state in self._kv_buffers[si].items():
+                    inp[name] = state
+
+                # Run subgraph on NPU
+                self._subgraph_requests[si].infer(inp)
+
+                # Read conv states (direct from NPU output)
+                for past_name in self._conv_states[si]:
+                    present_name = past_name.replace(".past.", ".present.")
+                    self._conv_states[si][past_name] = (
+                        self._subgraph_requests[si].get_tensor(present_name).data.copy()
+                    )
+
+                # CPU FP32 recurrent state update
+                self._cpu_fp32_state_update(si)
+
+                # Read KV outputs
+                self._read_kv_outputs(si)
+
+                # Read hidden_states output as FP32 for next subgraph
+                hidden = self._subgraph_requests[si].get_tensor(
+                    "hidden_states"
+                ).data.copy().astype(np.float32)
+
+            self._past_length += 1
+
+        # Read logits from last subgraph
+        logits = torch.from_numpy(
+            self._subgraph_requests[-1].get_tensor("logits").data.copy()
+        )
+
+        return Qwen35Output(logits=logits, cache_params=Qwen35CacheState())
+
+    # -----------------------------------------------------------------
+    # generate() plumbing
+    # -----------------------------------------------------------------
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        cache_params: Optional[Qwen35CacheState] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        if cache_position is not None and cache_position[0] > 0:
+            input_ids = input_ids[:, -1:]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "cache_params": cache_params,
+            "cache_position": cache_position,
+        }
+
+    def _update_model_kwargs_for_generation(
+        self,
+        outputs: ModelOutput,
+        model_kwargs: Dict[str, Any],
+        num_new_tokens: int = 1,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        model_kwargs["cache_params"] = outputs.get("cache_params", None)
+        if (
+            model_kwargs.get("use_cache", True)
+            and "cache_position" in model_kwargs
+            and model_kwargs["cache_position"] is not None
+        ):
+            model_kwargs["cache_position"] = (
+                model_kwargs["cache_position"][-1:] + num_new_tokens
+            )
+        return model_kwargs
+
+    def __call__(self, *args, **kwargs) -> Qwen35Output:
+        return self.forward(*args, **kwargs)
+
+    def reset(self) -> None:
+        self._reset_states()
+
+    def __repr__(self) -> str:
+        model_type = getattr(self.config, "model_type", "unknown")
+        return (
+            f"Qwen35MultiSubgraphModel(model_type={model_type!r}, "
+            f"subgraphs={self._num_subgraphs}, "
+            f"max_cache_len={self._max_cache_len})"
         )

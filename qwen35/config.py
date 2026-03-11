@@ -63,9 +63,120 @@ QWEN35_MODEL_CPU = Qwen35ModelConfig(
     device="CPU",
 )
 
-QWEN35_MODELS = {"CPU": QWEN35_MODEL_CPU}
+QWEN35_MODEL_GPU = Qwen35ModelConfig(
+    model_xml=str(MODELS_DIR / "Qwen3.5-0.8B-ov" / "openvino_model.xml"),
+    hf_model_id="Qwen/Qwen3.5-0.8B",
+    device="GPU",
+)
 
-DEFAULT_QWEN35_MODEL = "CPU"
+QWEN35_MODELS = {"CPU": QWEN35_MODEL_CPU, "GPU": QWEN35_MODEL_GPU}
+
+DEFAULT_QWEN35_MODEL = "GPU"
+
+# ---------------------------------------------------------------------------
+# NPU configuration
+# ---------------------------------------------------------------------------
+
+NPU_CACHE_DIR = MODELS_DIR / "npu_cache"
+
+# NPU model uses Loop-free IR (seq_len=1, token-by-token prefill)
+NPU_MODEL_DIR = MODELS_DIR / "Qwen3.5-0.8B-npu"
+
+# Max KV cache positions for NPU static cache.
+# Limits total context length (prompt + generation) to this value.
+NPU_MAX_CACHE_LEN = 256
+
+NPU_OV_CONFIG = {
+    "NPU_USE_NPUW": "YES",
+    "NPUW_FOLD": "NO",
+    "CACHE_DIR": str(NPU_CACHE_DIR),
+}
+
+QWEN35_MODEL_NPU = Qwen35ModelConfig(
+    model_xml=str(NPU_MODEL_DIR / "openvino_model.xml"),
+    hf_model_id="Qwen/Qwen3.5-0.8B",
+    device="NPU",
+    ov_config=NPU_OV_CONFIG,
+)
+
+QWEN35_MODELS["NPU"] = QWEN35_MODEL_NPU
+
+# NPUW_LLM model: KV cache managed on-device by NPUW_LLM engine
+NPUW_MODEL_DIR = MODELS_DIR / "Qwen3.5-0.8B-npuw"
+
+NPUW_LLM_OV_CONFIG = {
+    "NPU_USE_NPUW": "YES",
+    "NPUW_LLM": "YES",
+    "NPUW_LLM_MAX_PROMPT_LEN": "128",
+    "NPUW_LLM_PREFILL_HINT": "DYNAMIC",
+    "NPUW_LLM_PREFILL_CHUNK_SIZE": "1",
+    "NPUW_FOLD": "NO",
+    "CACHE_DIR": str(NPU_CACHE_DIR),
+}
+
+QWEN35_MODEL_NPUW = Qwen35ModelConfig(
+    model_xml=str(NPUW_MODEL_DIR / "openvino_model.xml"),
+    hf_model_id="Qwen/Qwen3.5-0.8B",
+    device="NPU",
+    ov_config=NPUW_LLM_OV_CONFIG,
+)
+
+QWEN35_MODELS["NPUW"] = QWEN35_MODEL_NPUW
+
+# ---------------------------------------------------------------------------
+# Hybrid NPU+CPU configuration (NPU inference + CPU FP32 GDN state update)
+# ---------------------------------------------------------------------------
+
+HYBRID_MODEL_DIR = MODELS_DIR / "Qwen3.5-0.8B-hybrid"
+
+HYBRID_OV_CONFIG = {
+    "NPU_USE_NPUW": "YES",
+    "NPUW_FOLD": "NO",
+    "CACHE_DIR": str(NPU_CACHE_DIR),
+}
+
+QWEN35_MODEL_HYBRID = Qwen35ModelConfig(
+    model_xml=str(HYBRID_MODEL_DIR / "openvino_model.xml"),
+    hf_model_id="Qwen/Qwen3.5-0.8B",
+    device="NPU",
+    ov_config=HYBRID_OV_CONFIG,
+)
+
+QWEN35_MODELS["HYBRID"] = QWEN35_MODEL_HYBRID
+
+# Hybrid model embed_tokens path
+HYBRID_EMBED_TOKENS_NPY = str(HYBRID_MODEL_DIR / "embed_tokens.npy")
+
+# ---------------------------------------------------------------------------
+# Multi-subgraph NPU configuration (6 subgraphs x 4 layers each)
+# ---------------------------------------------------------------------------
+
+MULTISUB_MODEL_DIR = MODELS_DIR / "Qwen3.5-0.8B-multisub"
+
+MULTISUB_OV_CONFIG = {
+    "NPU_USE_NPUW": "YES",
+    "NPUW_FOLD": "NO",
+    "CACHE_DIR": str(NPU_CACHE_DIR),
+}
+
+# Number of subgraphs and layers per subgraph
+MULTISUB_NUM_SUBGRAPHS = 6
+MULTISUB_LAYERS_PER_SUBGRAPH = 4  # [GDN, GDN, GDN, FullAttn]
+
+# Multi-subgraph embed_tokens path
+MULTISUB_EMBED_TOKENS_NPY = str(MULTISUB_MODEL_DIR / "embed_tokens.npy")
+
+# ---------------------------------------------------------------------------
+# NPU v2 configuration (6 subgraphs with host-side rotary precomputation)
+# ---------------------------------------------------------------------------
+
+NPU_V2_MODEL_DIR = MODELS_DIR / "Qwen3.5-0.8B-npu-v2"
+
+NPU_V2_OV_CONFIG = {
+    # No NPUW — each subgraph is small enough (4 layers) for direct NPU compilation.
+    # NPUW's output type handling conflicts with FP16→FP32 conversion.
+    "CACHE_DIR": str(NPU_CACHE_DIR),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +195,9 @@ VL_DECODER_XML = str(VL_MODEL_DIR / "openvino_model.xml")
 
 # Text-only model embed_tokens path
 EMBED_TOKENS_NPY = str(MODELS_DIR / "Qwen3.5-0.8B-ov" / "embed_tokens.npy")
+
+# NPU model embed_tokens path
+NPU_EMBED_TOKENS_NPY = str(NPU_MODEL_DIR / "embed_tokens.npy")
 
 QWEN35_VL_MODEL_CPU = Qwen35ModelConfig(
     model_xml=VL_DECODER_XML,

@@ -239,3 +239,47 @@ def patch_stateful_hybrid_ssm(ov_model: ov.Model) -> None:
     batch_dim = 0
     fuse_cache_reorder(ov_model, not_cache_inputs, cache_inputs, batch_dim)
     make_stateful(ov_model, not_cache_inputs, cache_inputs, cache_outputs, batch_dim)
+
+
+def patch_stateful_kv_only(ov_model: ov.Model) -> None:
+    """Convert only KV cache (key/value) pairs to stateful form.
+
+    Conv and recurrent states remain as explicit Parameters and Results,
+    managed in Python at inference time.  This is needed for NPU where
+    NPUW_LLM manages KV cache internally but cannot handle the non-KV
+    GDN states (different shape semantics: dim 2 in KV cache is
+    past_sequence_length, but dim 2 in recurrent state is D_k=128
+    which is static and must not be treated as a sequence dimension).
+    """
+    kv_prefixes = ["cache_params.past.key", "cache_params.past.value"]
+    kv_output_prefixes = ["cache_params.present.key", "cache_params.present.value"]
+
+    kv_input_names = []
+    not_kv_inputs = []
+    for inp in ov_model.inputs:
+        names = inp.get_names()
+        is_kv = any(
+            any(prefix in name for prefix in kv_prefixes)
+            for name in names
+        )
+        if is_kv:
+            kv_input_names.append(next(
+                name for name in names
+                if any(prefix in name for prefix in kv_prefixes)
+            ))
+        else:
+            not_kv_inputs.append(inp)
+
+    kv_output_names = []
+    for out in ov_model.outputs:
+        names = out.get_names()
+        for name in names:
+            if any(prefix in name for prefix in kv_output_prefixes):
+                kv_output_names.append(name)
+                break
+
+    batch_dim = 0
+    # Only fuse beam reorder for KV cache inputs (not conv/recurrent)
+    fuse_cache_reorder(ov_model, not_kv_inputs, kv_input_names, batch_dim)
+    # Only make KV cache stateful (not conv/recurrent)
+    make_stateful(ov_model, not_kv_inputs, kv_input_names, kv_output_names, batch_dim)
