@@ -374,12 +374,15 @@ class Qwen35OVModel(GenerationMixin):
             self._request.get_tensor("logits").data.copy()
         )
 
-        # --- read cache state from OV variables ----------------------------
-        cache_state = Qwen35CacheState.from_query_state(
-            self._request.query_state()
-        )
+        # For stateful models the cache lives inside the OV inference
+        # request.  Reading it back via query_state() on every decode step
+        # triggers a full device-to-host transfer of all 48 state tensors
+        # (210+ MB at long contexts).  Return a lightweight sentinel
+        # instead — the only consumer checks ``cache_params is None``
+        # to decide whether to reset state on the next prefill.
+        _SENTINEL_CACHE = Qwen35CacheState()
 
-        return Qwen35Output(logits=logits, cache_params=cache_state)
+        return Qwen35Output(logits=logits, cache_params=_SENTINEL_CACHE)
 
     # -----------------------------------------------------------------
     # generate() plumbing
