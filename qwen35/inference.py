@@ -241,6 +241,16 @@ class Qwen35OVModel(GenerationMixin):
         core = ov.Core()
         ov_model = core.read_model(str(xml_path))
 
+        # The IR is saved with FP16 compression, so outputs are f16.
+        # CPU auto-promotes to f32, but GPU and NPU do not -- add a
+        # PrePostProcessor pass to convert outputs to f32 explicitly.
+        if device in ("GPU", "NPU"):
+            from openvino.preprocess import PrePostProcessor
+            ppp = PrePostProcessor(ov_model)
+            for i in range(len(ov_model.outputs)):
+                ppp.output(i).tensor().set_element_type(ov.Type.f32)
+            ov_model = ppp.build()
+
         compile_props = ov_config or {}
         compiled = core.compile_model(ov_model, device, compile_props)
         request = compiled.create_infer_request()
@@ -507,7 +517,19 @@ class Qwen35VLModel:
         compile_props = ov_config or {}
         if not compile_props and device in ("CPU", "GPU"):
             compile_props = {"PERFORMANCE_HINT": "LATENCY"}
-        self._compiled = core.compile_model(decoder_xml, device, compile_props)
+
+        ov_model = core.read_model(decoder_xml)
+
+        # FP16 IR outputs need explicit f32 conversion on GPU/NPU
+        # (CPU auto-promotes, GPU and NPU do not).
+        if device in ("GPU", "NPU"):
+            from openvino.preprocess import PrePostProcessor
+            ppp = PrePostProcessor(ov_model)
+            for i in range(len(ov_model.outputs)):
+                ppp.output(i).tensor().set_element_type(ov.Type.f32)
+            ov_model = ppp.build()
+
+        self._compiled = core.compile_model(ov_model, device, compile_props)
         self._request = self._compiled.create_infer_request()
         self._device_name = device
 

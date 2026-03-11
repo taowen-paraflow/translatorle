@@ -20,13 +20,11 @@ from qwen35.inference import Qwen35OVModel
 
 
 def main():
-    default_model = str(MODELS_DIR / "Qwen3.5-0.8B-ov")
-
     parser = argparse.ArgumentParser(description="Run Qwen3.5 OpenVINO inference")
     parser.add_argument(
         "--model-path",
-        default=default_model,
-        help="Path to exported OpenVINO model directory",
+        default=None,
+        help="Path to exported OpenVINO model directory (auto-detected from --device)",
     )
     parser.add_argument(
         "--prompt",
@@ -42,9 +40,25 @@ def main():
     parser.add_argument(
         "--device",
         default="CPU",
-        help="OpenVINO device (CPU, GPU, etc.)",
+        help="OpenVINO device (CPU, GPU)",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Sampling temperature (enables sampling when set)",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Top-p (nucleus) sampling threshold",
     )
     args = parser.parse_args()
+
+    # Auto-detect model path based on device
+    if args.model_path is None:
+        args.model_path = str(MODELS_DIR / "Qwen3.5-0.8B-ov")
 
     print(f"Loading model from {args.model_path} on {args.device}...")
     model = Qwen35OVModel.from_pretrained(args.model_path, device=args.device)
@@ -55,10 +69,17 @@ def main():
 
     print(f"\nPrompt: {args.prompt!r}")
     start = time.time()
+    generate_kwargs = dict(max_new_tokens=args.max_new_tokens)
+    if args.temperature is not None:
+        generate_kwargs["do_sample"] = True
+        generate_kwargs["temperature"] = args.temperature
+        if args.top_p is not None:
+            generate_kwargs["top_p"] = args.top_p
+    else:
+        generate_kwargs["do_sample"] = False
     outputs = model.generate(
         **inputs,
-        max_new_tokens=args.max_new_tokens,
-        do_sample=False,
+        **generate_kwargs,
     )
     elapsed = time.time() - start
 

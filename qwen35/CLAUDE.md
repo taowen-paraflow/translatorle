@@ -49,11 +49,11 @@ Qwen3.5 使用 **Gated Delta Networks (GDN) 混合架构**，不是标准 Transf
 
 | 设备 | 状态 | 速度 | 备注 |
 |------|------|------|------|
-| CPU | 正常 | 10-14 tok/s | |
-| GPU | 正常 | ~11 tok/s | |
-| NPU | **不可用** | — | dynamic shape (KV cache seq_len) 导致编译失败 |
+| CPU | 正常 | 10-14 tok/s | 推荐 |
+| GPU | 正常 | 6-11 tok/s | `INFERENCE_PRECISION_HINT: f16`，同一份 IR |
+| NPU | **不可用（FP16精度不足）** | — | GDN 递归 state 在 FP16 下累积误差发散 |
 
-NPU 失败原因：full attention 层的 KV cache 有动态 sequence_length 维度，NPU 编译器报 `to_shape was called on a dynamic shape`。混合架构无法用 `LLMPipeline`（只支持标准 KV-cache transformer），需要 NPUW 配置支持。
+**NPU 结论**：Intel NPU 硬件精度固定 FP16，GDN delta rule 线性递归 `S_t = S_{t-1} * exp(g_t) + outer(k_t, delta_t)` 每步乘法放大舍入误差，18 层串联后 logit 快速发散。已验证多种方案（NPUW_LLM、混合 Shadow FP32、多子图 4 层分组）均无法解决。CPU/GPU 是推荐设备。详见 `intel-npu-gdn.md`。
 
 ## 导出流水线
 
@@ -114,7 +114,7 @@ uv run python -m qwen35.scripts.run_vl_inference --image photo.jpg --prompt "描
 
 #### 待改进
 - **固定分辨率限制**：当前只支持 384×384，不支持动态分辨率（ViT 位置编码在导出时固化）
-- **NPU 不可用**：同 text-only，full attention 层的 KV cache 动态维度导致编译失败
+- **NPU 不可用**：同 text-only，GDN 递归 state 在 NPU FP16 下累积误差发散
 - **仅 Greedy 解码**：不支持 temperature/top-p/beam search
 - **停止条件不完善**：生成末尾偶现空代码块等无意义 token
 

@@ -63,9 +63,15 @@ QWEN35_MODEL_CPU = Qwen35ModelConfig(
     device="CPU",
 )
 
-QWEN35_MODELS = {"CPU": QWEN35_MODEL_CPU}
+QWEN35_MODEL_GPU = Qwen35ModelConfig(
+    model_xml=str(MODELS_DIR / "Qwen3.5-0.8B-ov" / "openvino_model.xml"),
+    hf_model_id="Qwen/Qwen3.5-0.8B",
+    device="GPU",
+)
 
-DEFAULT_QWEN35_MODEL = "CPU"
+QWEN35_MODELS = {"CPU": QWEN35_MODEL_CPU, "GPU": QWEN35_MODEL_GPU}
+
+DEFAULT_QWEN35_MODEL = "GPU"
 
 
 # ---------------------------------------------------------------------------
