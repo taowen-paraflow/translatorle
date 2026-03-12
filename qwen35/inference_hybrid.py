@@ -24,41 +24,6 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Hybrid state (explicit, not OV stateful)
-# ---------------------------------------------------------------------------
-
-class HybridState:
-    """Manages attention KV cache state for hybrid inference.
-
-    GDN conv/recurrent states are managed internally by OpenVINO stateful
-    variables (ReadValue/Assign) — they persist in GPU memory between infer()
-    calls, eliminating host<->GPU state transfer overhead.
-    """
-
-    def __init__(self, num_blocks: int, num_kv_heads: int, head_dim: int):
-        self.num_blocks = num_blocks
-        self._num_kv_heads = num_kv_heads
-        self._head_dim = head_dim
-
-        # Attention KV caches: 1 layer per block
-        # Start with past_seq=1 (zeros) because OV can't handle 0-dim tensors
-        self.key_caches: List[np.ndarray] = [
-            np.zeros((1, num_kv_heads, 1, head_dim), dtype=np.float32)
-            for _ in range(num_blocks)
-        ]
-        self.value_caches: List[np.ndarray] = [
-            np.zeros((1, num_kv_heads, 1, head_dim), dtype=np.float32)
-            for _ in range(num_blocks)
-        ]
-
-    def reset(self):
-        """Reset attention KV caches to zeros."""
-        for i in range(len(self.key_caches)):
-            self.key_caches[i] = np.zeros((1, self._num_kv_heads, 1, self._head_dim), dtype=np.float32)
-            self.value_caches[i] = np.zeros((1, self._num_kv_heads, 1, self._head_dim), dtype=np.float32)
-
-
-# ---------------------------------------------------------------------------
 # Main hybrid model class
 # ---------------------------------------------------------------------------
 
@@ -72,19 +37,27 @@ class Qwen35HybridModel:
         attn_device: str = "NPU",
         head_device: str = "GPU",
         attn_past_seq: int = 256,
+        attn_stateful: bool = True,
+        prefill_chunk_size: int = 16,
     ):
-        """Load and compile all 13 subgraphs.
+        """Load and compile all subgraphs.
 
         Args:
             model_dir: Directory containing the hybrid IR files.
             gdn_device: Device for GDN blocks (default: GPU).
             attn_device: Device for attention blocks (default: NPU).
             head_device: Device for the head block (default: GPU).
+            embed_device: Device for the embedding block (default: GPU).
             attn_past_seq: Static past_seq length for NPU attention blocks.
                 NPU requires static shapes; KV caches are padded to this size.
         """
         model_dir = Path(model_dir)
         core = ov.Core()
+
+        # Enable model caching — NPU compilation is ~10s/block (60s total).
+        # After first run, cached blobs make subsequent starts <1s.
+        cache_dir = str(model_dir / "cache")
+        core.set_property({"CACHE_DIR": cache_dir})
 
         self._attn_past_seq = attn_past_seq
         self._gdn_device = gdn_device
@@ -147,11 +120,12 @@ class Qwen35HybridModel:
         self._init_gdn_states()
 
         # --- Compile Attention blocks ---
-        # GPU/CPU: stateful KV cache (stays on device, no host transfer)
-        # NPU: explicit I/O (static shapes + padding, KV transferred each step)
-        self._attn_stateful = (attn_device != "NPU")
+        # Fixed-size KV cache (ScatterUpdate) enables stateful on ALL devices.
+        # NPU: try stateful first; if it fails at runtime, can fall back to explicit.
+        self._attn_stateful = attn_stateful
         mode_str = "stateful" if self._attn_stateful else "explicit I/O"
-        logger.info("Compiling %d Attn blocks on %s (%s) ...", num_blocks, attn_device, mode_str)
+        logger.info("Compiling %d Attn blocks on %s (%s, fixed KV=%d) ...",
+                     num_blocks, attn_device, mode_str, attn_past_seq)
         self._attn_models: List[ov.CompiledModel] = []
         self._attn_requests: List = []
         t0 = time.time()
@@ -160,10 +134,10 @@ class Qwen35HybridModel:
 
         for i in range(num_blocks):
             ir = core.read_model(str(model_dir / f"attn_block_{i}.xml"))
+            if attn_device == "NPU":
+                ir = self._reshape_attn_static(ir, attn_past_seq)
             if self._attn_stateful:
                 apply_make_stateful_transformation(ir, attn_state_map)
-            elif attn_device == "NPU":
-                ir = self._reshape_attn_static(ir, attn_past_seq)
             if attn_device in ("GPU", "NPU"):
                 ir = self._add_f32_output_conversion(ir)
             if i == 0:
@@ -171,13 +145,33 @@ class Qwen35HybridModel:
                             [(inp.get_any_name(), str(inp.partial_shape), str(inp.element_type)) for inp in ir.inputs])
                 if self._attn_stateful:
                     logger.info("  Attn block sinks: %d", len(ir.get_sinks()))
-            compiled = core.compile_model(ir, attn_device)
+            npu_config = {"NPU_COMPILER_TYPE": "PREFER_PLUGIN"} if attn_device == "NPU" else {}
+            compiled = core.compile_model(ir, attn_device, npu_config)
             self._attn_models.append(compiled)
             self._attn_requests.append(compiled.create_infer_request())
         logger.info("  Attn compilation: %.1fs", time.time() - t0)
 
         if self._attn_stateful:
             self._init_attn_states()
+        else:
+            self._init_kv_caches()
+
+        # --- Compile prefill Attention blocks (NPU, S=prefill_chunk_size) ---
+        self._prefill_chunk_size = prefill_chunk_size
+        self._attn_prefill_requests: List = []
+        if (prefill_chunk_size > 1 and attn_device == "NPU"
+                and not self._attn_stateful):
+            logger.info("Compiling %d prefill Attn blocks on NPU (S=%d) ...",
+                        num_blocks, prefill_chunk_size)
+            t0 = time.time()
+            for i in range(num_blocks):
+                ir = core.read_model(str(model_dir / f"attn_block_{i}.xml"))
+                ir = self._reshape_attn_static(ir, attn_past_seq, seq_len=prefill_chunk_size)
+                ir = self._add_f32_output_conversion(ir)
+                npu_config = {"NPU_COMPILER_TYPE": "PREFER_PLUGIN"}
+                compiled = core.compile_model(ir, "NPU", npu_config)
+                self._attn_prefill_requests.append(compiled.create_infer_request())
+            logger.info("  Prefill Attn compilation: %.1fs", time.time() - t0)
 
         # --- Compile Head block (GPU) ---
         logger.info("Compiling Head on %s ...", head_device)
@@ -198,12 +192,6 @@ class Qwen35HybridModel:
         from transformers import AutoTokenizer
         self._tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
 
-        # --- State (only KV caches; GDN states are OV-internal) ---
-        self._state = HybridState(
-            num_blocks=num_blocks,
-            num_kv_heads=self._num_kv_heads,
-            head_dim=self._head_dim,
-        )
         self._past_length = 0
 
         # Profiling instrumentation (disable for clean benchmarks)
@@ -276,11 +264,11 @@ class Qwen35HybridModel:
     def _init_attn_states(self):
         """Initialize attention KV cache stateful variables.
 
-        KV cache starts empty (past_seq=0). The IR's internal Concat grows it
-        each step: Concat([B,H,0,D], [B,H,1,D]) -> [B,H,1,D] on first call.
-        No dummy entry needed — all positions are real tokens.
+        Fixed-size KV cache: shape is always [B, H, MAX_CACHE_LEN, D].
+        All positions start as zeros; the attention mask ensures only
+        written positions are attended to.
         """
-        kv_shape = (1, self._num_kv_heads, 0, self._head_dim)
+        kv_shape = (1, self._num_kv_heads, self._attn_past_seq, self._head_dim)
         for req in self._attn_requests:
             for s in req.query_state():
                 s.state = ov.Tensor(np.zeros(kv_shape, dtype=np.float32))
@@ -294,26 +282,28 @@ class Qwen35HybridModel:
             ppp.output(i).tensor().set_element_type(ov.Type.f32)
         return ppp.build()
 
-    def _reshape_attn_static(self, ir, past_seq: int):
+    def _reshape_attn_static(self, ir, past_seq: int, seq_len: int = 1):
         """Reshape attention IR to fully static shapes for NPU compilation.
 
-        Uses index-based access to avoid name collision issues
-        (input 2/3 may share names with output 1/2).
+        Uses index-based access to avoid name collision issues.
+        With fixed-size KV cache, cache dim is already past_seq (MAX_CACHE_LEN).
         """
-        B, S = 1, 1
-        # Index-based: 0=hidden, 1=position_ids, 2=key_cache, 3=value_cache, 4=attention_mask
+        B, S = 1, seq_len
+        # Index-based: 0=hidden, 1=position_ids, 2=key_cache, 3=value_cache,
+        #              4=cache_position, 5=attention_mask
         shapes = {}
         for i, inp in enumerate(ir.inputs):
             name = inp.get_any_name()
-            ps = inp.partial_shape
             if i == 0:  # hidden: [B, S, hidden_size]
                 shapes[name] = ov.PartialShape([B, S, self._hidden_size])
             elif i == 1:  # position_ids: [3, B, S]
                 shapes[name] = ov.PartialShape([3, B, S])
             elif i in (2, 3):  # key/value cache: [B, num_kv_heads, past_seq, head_dim]
                 shapes[name] = ov.PartialShape([B, self._num_kv_heads, past_seq, self._head_dim])
-            elif i == 4:  # attention_mask: [B, 1, S, past_seq + S]
-                shapes[name] = ov.PartialShape([B, 1, S, past_seq + S])
+            elif i == 4:  # cache_position: [S]
+                shapes[name] = ov.PartialShape([S])
+            elif i == 5:  # attention_mask: [B, 1, S, past_seq]
+                shapes[name] = ov.PartialShape([B, 1, S, past_seq])
         ir.reshape(shapes)
         return ir
 
@@ -333,142 +323,103 @@ class Qwen35HybridModel:
         req.infer()
         return req.get_output_tensor(0).data.copy()
 
-    def _run_attn_block(self, block_idx: int, hidden: np.ndarray, position_ids: np.ndarray) -> np.ndarray:
-        """Run one Attention block (1 layer)."""
+    def _run_attn_block(self, block_idx: int, hidden: np.ndarray, position_ids: np.ndarray,
+                        use_prefill: bool = False) -> np.ndarray:
+        """Run one Attention block (1 layer) with fixed-size KV cache."""
         if self._attn_stateful:
             return self._run_attn_block_stateful(block_idx, hidden, position_ids)
-        return self._run_attn_block_explicit(block_idx, hidden, position_ids)
+        return self._run_attn_block_explicit(block_idx, hidden, position_ids, use_prefill=use_prefill)
 
     def _run_attn_block_stateful(self, block_idx: int, hidden: np.ndarray, position_ids: np.ndarray) -> np.ndarray:
-        """Run attention with stateful KV cache (GPU/CPU).
+        """Run attention with stateful fixed-size KV cache.
 
-        KV cache persists on device via ReadValue/Assign. Only hidden,
-        position_ids, and attention_mask are transferred each call.
+        KV cache persists on device via ReadValue/Assign (constant shape
+        [B, H, MAX_CACHE_LEN, D]). Only hidden, position_ids, cache_position,
+        and attention_mask are transferred each call.
         """
         batch_size = hidden.shape[0]
         seq_len = hidden.shape[1]
 
-        # All-zeros mask = attend to everything (no padding, no dummy entry)
-        key_seq = self._past_length + seq_len
-        attention_mask = np.zeros((batch_size, 1, seq_len, key_seq), dtype=np.float32)
+        cache_position = np.arange(
+            self._past_length, self._past_length + seq_len, dtype=np.int64)
+        attention_mask = self._build_attn_mask(batch_size, seq_len)
 
-        # After stateful transform: inputs are [hidden, position_ids, attention_mask]
+        # After stateful transform: inputs are [hidden, position_ids, cache_position, attention_mask]
         req = self._attn_requests[block_idx]
         req.set_input_tensor(0, ov.Tensor(np.ascontiguousarray(hidden)))
         req.set_input_tensor(1, ov.Tensor(np.ascontiguousarray(position_ids)))
-        req.set_input_tensor(2, ov.Tensor(np.ascontiguousarray(attention_mask)))
+        req.set_input_tensor(2, ov.Tensor(np.ascontiguousarray(cache_position)))
+        req.set_input_tensor(3, ov.Tensor(np.ascontiguousarray(attention_mask)))
         req.infer()
 
-        # Output may be 2D [batch*seq, hidden_size] — reshape to 3D
         return req.get_output_tensor(0).data.copy().reshape(batch_size, seq_len, -1)
 
-    def _run_attn_block_explicit(self, block_idx: int, hidden: np.ndarray, position_ids: np.ndarray) -> np.ndarray:
-        """Run attention with explicit KV cache I/O (NPU).
+    def _run_attn_block_explicit(self, block_idx: int, hidden: np.ndarray, position_ids: np.ndarray,
+                                  use_prefill: bool = False) -> np.ndarray:
+        """Run attention with explicit fixed-size KV cache I/O.
 
-        KV cache is padded to static size, transferred each step, then compacted.
+        KV cache is transferred each step but no padding/compaction needed
+        (fixed shape [B, H, MAX_CACHE_LEN, D] in and out).
         """
-        state = self._state
         batch_size = hidden.shape[0]
         seq_len = hidden.shape[1]
-        key_cache = state.key_caches[block_idx]
-        value_cache = state.value_caches[block_idx]
-        actual_cache_len = key_cache.shape[2]  # includes initial dummy at pos 0
 
-        # NPU needs static past_seq — pad KV cache
-        key_cache = self._pad_kv_cache(key_cache, self._attn_past_seq, is_key=True)
-        value_cache = self._pad_kv_cache(value_cache, self._attn_past_seq, is_key=False)
+        cache_position = np.arange(
+            self._past_length, self._past_length + seq_len, dtype=np.int64)
+        attention_mask = self._build_attn_mask(batch_size, seq_len)
 
-        # Build 4D attention mask: 0.0 = attend, -65504.0 = ignore
-        attention_mask = self._build_attn_mask(
-            batch_size, seq_len, actual_cache_len, key_cache.shape[2],
-        )
-
-        inputs = [hidden, position_ids, key_cache, value_cache, attention_mask]
-        req = self._attn_requests[block_idx]
-        for i, arr in enumerate(inputs):
-            req.set_input_tensor(i, ov.Tensor(np.ascontiguousarray(arr)))
+        # Explicit I/O: inputs are [hidden, position_ids, key_cache, value_cache, cache_position, attention_mask]
+        # Use prefill infer request (S=chunk_size) when available, else decode request (S=1)
+        if use_prefill and self._attn_prefill_requests:
+            req = self._attn_prefill_requests[block_idx]
+        else:
+            req = self._attn_requests[block_idx]
+        req.set_input_tensor(0, ov.Tensor(np.ascontiguousarray(hidden)))
+        req.set_input_tensor(1, ov.Tensor(np.ascontiguousarray(position_ids)))
+        req.set_input_tensor(2, ov.Tensor(np.ascontiguousarray(self._kv_caches[block_idx][0])))
+        req.set_input_tensor(3, ov.Tensor(np.ascontiguousarray(self._kv_caches[block_idx][1])))
+        req.set_input_tensor(4, ov.Tensor(np.ascontiguousarray(cache_position)))
+        req.set_input_tensor(5, ov.Tensor(np.ascontiguousarray(attention_mask)))
         req.infer()
 
-        hidden = req.get_output_tensor(0).data.copy().reshape(batch_size, seq_len, -1)
-        new_key = req.get_output_tensor(1).data.copy()
-        new_value = req.get_output_tensor(2).data.copy()
+        hidden_out = req.get_output_tensor(0).data.copy().reshape(batch_size, seq_len, -1)
+        # Update stored KV caches (output has same shape as input)
+        self._kv_caches[block_idx][0] = req.get_output_tensor(1).data.copy()
+        self._kv_caches[block_idx][1] = req.get_output_tensor(2).data.copy()
 
-        # Compact: remove padding zeros, keep real entries + new token
-        actual_past = state.key_caches[block_idx].shape[2]
-        P = self._attn_past_seq
-        new_key = np.concatenate([
-            new_key[:, :, :actual_past, :],
-            new_key[:, :, P:P+seq_len, :],
-        ], axis=2)
-        new_value = np.concatenate([
-            new_value[:, :, :actual_past, :],
-            new_value[:, :, P:P+seq_len, :],
-        ], axis=2)
+        return hidden_out
 
-        state.key_caches[block_idx] = new_key
-        state.value_caches[block_idx] = new_value
+    def _build_attn_mask(self, batch_size: int, seq_len: int) -> np.ndarray:
+        """Build 4D causal attention mask for fixed-size KV cache.
 
-        return hidden
+        Layout of key positions in the fixed buffer [0..MAX_CACHE_LEN-1]:
+          [0 .. past_length-1]                  -> previously written tokens (attend)
+          [past_length .. past_length+seq_len-1] -> current token(s) being written (attend)
+          [past_length+seq_len .. MAX_CACHE_LEN-1] -> empty/future (masked)
 
-    def _build_attn_mask(
-        self,
-        batch_size: int,
-        seq_len: int,
-        actual_cache_len: int,
-        padded_cache_len: int,
-    ) -> np.ndarray:
-        """Build 4D attention mask for one attention block.
-
-        After the attention layer concats input KV cache with the new token's KV,
-        the full key_seq = padded_cache_len + seq_len.
-
-        Layout of key positions:
-          [0]                          -> initial dummy (always masked)
-          [1 .. actual_cache_len-1]    -> real past tokens (attend)
-          [actual_cache_len .. padded_cache_len-1] -> padding (masked, NPU only)
-          [padded_cache_len .. padded_cache_len+seq_len-1] -> new token(s) (attend)
+        For seq_len > 1 (chunked prefill), applies causal masking so each
+        query can only attend to positions up to its own position.
 
         Returns:
-            attention_mask: shape [B, 1, seq_len, key_seq], dtype float32.
+            attention_mask: shape [B, 1, seq_len, MAX_CACHE_LEN], dtype float32.
             0.0 = attend, -65504.0 = ignore.
         """
         MASK_VALUE = np.float32(-65504.0)  # min fp16, guarantees ~0 softmax weight
-        key_seq = padded_cache_len + seq_len
+        max_len = self._attn_past_seq
 
-        mask = np.full((batch_size, 1, seq_len, key_seq), MASK_VALUE, dtype=np.float32)
-        # Unmask real past tokens (positions 1..actual_cache_len-1)
-        if actual_cache_len > 1:
-            mask[:, :, :, 1:actual_cache_len] = 0.0
-        # Unmask new token positions (positions padded_cache_len..padded_cache_len+seq_len-1)
-        mask[:, :, :, padded_cache_len:padded_cache_len + seq_len] = 0.0
+        # For each query q in [0..seq_len-1]:
+        #   attend to positions 0..past_length+q (inclusive)
+        #   mask positions past_length+q+1..MAX_CACHE_LEN-1
+        col = np.arange(max_len)
+        query_ends = np.arange(self._past_length + 1, self._past_length + seq_len + 1)
+        attend = col[None, :] < query_ends[:, None]  # [seq_len, max_len]
+        mask = np.where(attend, np.float32(0.0), MASK_VALUE)[None, None, :, :]  # [1, 1, seq_len, max_len]
+        if batch_size > 1:
+            mask = np.broadcast_to(mask, (batch_size, 1, seq_len, max_len)).copy()
         return mask
 
-    def _pad_kv_cache(self, cache: np.ndarray, target_len: int, is_key: bool = False) -> np.ndarray:
-        """Pad KV cache to target_len along dim 2.
-
-        For KEY cache: pad with large negative values so Q@K^T produces
-        very negative scores -> softmax gives ~0 weight (effectively masked).
-        For VALUE cache: pad with zeros (weight is ~0 anyway).
-        """
-        current_len = cache.shape[2]
-        if current_len >= target_len:
-            return cache[:, :, :target_len, :]
-        pad_len = target_len - current_len
-        if is_key:
-            # Large negative K → very negative attention scores → masked by softmax
-            pad = np.full(
-                (cache.shape[0], cache.shape[1], pad_len, cache.shape[3]),
-                -1e4, dtype=cache.dtype,
-            )
-        else:
-            pad = np.zeros(
-                (cache.shape[0], cache.shape[1], pad_len, cache.shape[3]),
-                dtype=cache.dtype,
-            )
-        return np.concatenate([cache, pad], axis=2)
-
     def forward(self, token_ids: np.ndarray) -> np.ndarray:
-        """Run one forward pass through all 13 subgraphs.
+        """Run one forward pass through all subgraphs.
 
         Args:
             token_ids: Shape [1, seq_len] int64.
@@ -503,6 +454,10 @@ class Qwen35HybridModel:
 
         hidden = embeds
 
+        # Auto-detect prefill mode: use prefill requests when seq_len matches chunk size
+        use_prefill = (seq_len == self._prefill_chunk_size
+                       and len(self._attn_prefill_requests) > 0)
+
         for i in range(self._num_blocks):
             if profiling:
                 t0 = time.perf_counter()
@@ -512,7 +467,7 @@ class Qwen35HybridModel:
 
             if profiling:
                 t0 = time.perf_counter()
-            hidden = self._run_attn_block(i, hidden, position_ids)
+            hidden = self._run_attn_block(i, hidden, position_ids, use_prefill=use_prefill)
             if profiling:
                 self._profile_stats['attn_blocks'][i].append(time.perf_counter() - t0)
 
@@ -538,12 +493,20 @@ class Qwen35HybridModel:
 
     def reset(self):
         """Reset all states for a new generation."""
-        if not self._attn_stateful:
-            self._state.reset()       # Reset attention KV caches (NPU explicit mode)
+        if self._attn_stateful:
+            self._init_attn_states()  # Reset attention KV cache stateful variables
         else:
-            self._init_attn_states()  # Reset attention stateful variables
+            self._init_kv_caches()    # Reset explicit KV cache buffers
         self._init_gdn_states()       # Reset GDN stateful variables (can't use s.reset())
         self._past_length = 0
+
+    def _init_kv_caches(self):
+        """Initialize explicit KV cache buffers (non-stateful mode)."""
+        kv_shape = (1, self._num_kv_heads, self._attn_past_seq, self._head_dim)
+        self._kv_caches = [
+            [np.zeros(kv_shape, dtype=np.float32), np.zeros(kv_shape, dtype=np.float32)]
+            for _ in range(self._num_blocks)
+        ]
 
     def generate(
         self,
@@ -567,16 +530,23 @@ class Qwen35HybridModel:
         token_list = self._tokenizer.encode(prompt)
         input_ids = np.array([token_list], dtype=np.int64)  # [1, seq_len]
 
-        # Prefill — token-by-token (NPU attention blocks require S=1)
+        # Prefill — chunked (S=chunk_size) + remainder token-by-token (S=1)
         t0 = time.time()
-        for i in range(input_ids.shape[1]):
-            token_input = input_ids[:, i:i+1]  # [1, 1]
-            logits = self.forward(token_input)
-        prefill_time = time.time() - t0
         prompt_len = input_ids.shape[1]
+        chunk_size = self._prefill_chunk_size
+        pos = 0
+        # Full chunks (S=chunk_size)
+        while pos + chunk_size <= prompt_len:
+            logits = self.forward(input_ids[:, pos:pos + chunk_size])
+            pos += chunk_size
+        # Remainder: token-by-token (S=1) — cannot pad because GDN Loop would process padding
+        while pos < prompt_len:
+            logits = self.forward(input_ids[:, pos:pos + 1])
+            pos += 1
+        prefill_time = time.time() - t0
         logger.info(
-            "Prefill: %d tokens in %.1fms (%.1f tok/s)",
-            prompt_len, prefill_time * 1000, prompt_len / prefill_time,
+            "Prefill: %d tokens in %.1fms (%.1f tok/s, chunk=%d)",
+            prompt_len, prefill_time * 1000, prompt_len / prefill_time, chunk_size,
         )
 
         # Greedy decode
@@ -637,6 +607,8 @@ def main():
         help="HYBRID=GDN on GPU + Attn on NPU, GPU_ONLY=all GPU, CPU_ONLY=all CPU",
     )
     parser.add_argument("--attn-past-seq", type=int, default=256, help="Static KV cache size for NPU")
+    parser.add_argument("--no-attn-stateful", action="store_true", help="Use explicit KV I/O instead of stateful")
+    parser.add_argument("--prefill-chunk-size", type=int, default=16, help="Prefill chunk size (1=token-by-token)")
     args = parser.parse_args()
 
     device_map = {
@@ -652,6 +624,8 @@ def main():
         attn_device=attn_dev,
         head_device=head_dev,
         attn_past_seq=args.attn_past_seq,
+        attn_stateful=not args.no_attn_stateful,
+        prefill_chunk_size=args.prefill_chunk_size,
     )
 
     print(f"\nPrompt: {args.prompt}")

@@ -22,15 +22,24 @@ struct ModelConfig {
 };
 
 /// Hybrid GPU+NPU inference for Qwen3.5 using 13 subgraph IRs.
-/// GDN blocks run on GPU (stateful), Attention blocks on NPU (explicit I/O),
-/// Head on GPU.
+/// GDN blocks run on GPU (stateful), Attention blocks on NPU (explicit I/O
+/// with fixed-size ScatterUpdate-3 KV cache), Head on GPU.
+///
+/// Performance optimizations over naive approach:
+///   - CACHE_DIR for NPU/GPU model caching (60s→<1s startup)
+///   - Fixed-size KV cache (no per-step padding/compacting)
+///   - Pre-allocated tensor wrappers (zero allocation in hot loop)
+///   - Chunked prefill (S=16 NPU models, skip Head for intermediate chunks)
+///   - Return logits pointer (no 1MB copy per decode step)
 class Qwen35HybridModel {
 public:
-    /// @param model_dir      Directory containing the 13 hybrid IR files
-    /// @param attn_past_seq  Static KV cache size for NPU attention blocks (default 256)
-    /// @param tokenizers_lib Path to openvino_tokenizers shared library (.dll/.so)
+    /// @param model_dir           Directory containing the 13 hybrid IR files
+    /// @param attn_past_seq       Static KV cache size for NPU attention (default 256)
+    /// @param prefill_chunk_size  Tokens per prefill chunk (default 16, 1=token-by-token)
+    /// @param tokenizers_lib      Path to openvino_tokenizers shared library (.dll/.so)
     Qwen35HybridModel(const std::string& model_dir,
                        int attn_past_seq = 256,
+                       int prefill_chunk_size = 16,
                        const std::string& tokenizers_lib = "");
 
     ~Qwen35HybridModel();
@@ -46,23 +55,26 @@ private:
     void load_embeddings(const std::string& model_dir);
 
     void init_gdn_states();
+    void init_kv_caches();
+    void alloc_buffers();
     void reset();
 
-    std::vector<float> forward(const std::vector<int64_t>& token_ids);
+    /// Run one forward pass. Returns pointer to last token's logits (vocab_size floats).
+    /// Pointer valid until next forward() call. If run_head=false, returns nullptr.
+    const float* forward(const int64_t* token_ids, int seq_len, bool run_head = true);
 
-    void run_gdn_block(int block_idx, std::vector<float>& hidden, int seq_len);
-    void run_attn_block(int block_idx, std::vector<float>& hidden, int seq_len);
-
-    std::vector<float> build_attn_mask(int actual_cache_len, int padded_cache_len, int seq_len);
-    std::vector<float> pad_kv_cache(const std::vector<float>& cache, int num_heads,
-                                     int current_len, int target_len, int head_dim, bool is_key);
+    void run_gdn_block(int block_idx, int seq_len);
+    void run_attn_block(int block_idx, int seq_len, bool use_prefill);
+    void fill_attn_mask(int seq_len);
 
     static std::shared_ptr<ov::Model> add_f32_output_conversion(std::shared_ptr<ov::Model> model);
 
     // Config
     ModelConfig cfg_;
     int attn_past_seq_;
+    int prefill_chunk_size_;
     int past_length_;
+    int kv_total_;  // num_kv_heads * attn_past_seq * head_dim (cached for memcpy)
 
     // OpenVINO
     ov::Core core_;
@@ -71,9 +83,13 @@ private:
     std::vector<ov::CompiledModel> gdn_models_;
     std::vector<ov::InferRequest> gdn_requests_;
 
-    // Attention blocks — NPU, explicit I/O (KV cache padded to static size)
+    // Attention blocks — NPU, explicit I/O, S=1 (decode)
     std::vector<ov::CompiledModel> attn_models_;
     std::vector<ov::InferRequest> attn_requests_;
+
+    // Attention blocks — NPU, explicit I/O, S=prefill_chunk_size (prefill)
+    std::vector<ov::CompiledModel> attn_prefill_models_;
+    std::vector<ov::InferRequest> attn_prefill_requests_;
 
     // Head block — GPU, stateless
     ov::CompiledModel head_model_;
@@ -82,13 +98,30 @@ private:
     // Embedding table [vocab_size * hidden_size] stored flat, float32
     std::vector<float> embed_table_;
 
-    // KV caches for NPU explicit mode [1, num_kv_heads, len, head_dim] flat
-    struct KVCache {
-        std::vector<float> key;
-        std::vector<float> value;
-        int len;  // current sequence length in cache (starts at 1 for dummy)
-    };
-    std::vector<KVCache> kv_caches_;
+    // Fixed-size KV caches — ov::Tensor [1, H, P, D] per block (owns memory)
+    std::vector<ov::Tensor> kv_key_tensors_;
+    std::vector<ov::Tensor> kv_value_tensors_;
+
+    // Pre-allocated buffers (reused every forward call, never reallocated)
+    std::vector<float> hidden_buf_;         // max_seq * hidden_size
+    std::vector<int64_t> gdn_mask_buf_;     // max_seq (all 1s)
+    std::vector<int64_t> pos_buf_;          // 3 * max_seq
+    std::vector<int64_t> cache_pos_buf_;    // max_seq
+    std::vector<float> attn_mask_buf_;      // max_seq * attn_past_seq
+
+    // Pre-allocated tensor wrappers — decode (S=1), no allocation in hot loop
+    ov::Tensor s1_hidden_;      // [1, 1, hidden_size] wrapping hidden_buf_
+    ov::Tensor s1_gdn_mask_;    // [1, 1] wrapping gdn_mask_buf_
+    ov::Tensor s1_pos_;         // [3, 1, 1] wrapping pos_buf_
+    ov::Tensor s1_cache_pos_;   // [1] wrapping cache_pos_buf_
+    ov::Tensor s1_attn_mask_;   // [1, 1, 1, P] wrapping attn_mask_buf_
+
+    // Pre-allocated tensor wrappers — prefill (S=chunk_size)
+    ov::Tensor sc_hidden_;      // [1, C, hidden_size] wrapping hidden_buf_
+    ov::Tensor sc_gdn_mask_;    // [1, C] wrapping gdn_mask_buf_
+    ov::Tensor sc_pos_;         // [3, 1, C] wrapping pos_buf_
+    ov::Tensor sc_cache_pos_;   // [C] wrapping cache_pos_buf_
+    ov::Tensor sc_attn_mask_;   // [1, 1, C, P] wrapping attn_mask_buf_
 
     // Tokenizer
     std::unique_ptr<OVTokenizer> tokenizer_;

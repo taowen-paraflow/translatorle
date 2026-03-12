@@ -127,3 +127,62 @@ def convert_recurrent_attention_cell(context):
     final_output = ops.concat([core_attn_out_new, last_recurrent_state_new], 0)
 
     return [final_output.output(0)]
+
+
+def convert_kv_cache_scatter_update(context):
+    """Build ScatterUpdate-3 node for KV cache update at cache_position.
+
+    Replaces KVCacheScatterUpdate module with axis-based ScatterUpdate.
+    This is different from ScatterElementsUpdate (which torch.scatter produces)
+    — ScatterUpdate-3 replaces entire slices along an axis.
+
+    Inputs (from KVCacheScatterUpdate.forward args):
+        0: cache          [B, H, MAX_S, D]  — the KV buffer
+        1: new_kv         [B, H, S, D]      — new key/value states (S=1 for decode)
+        2: cache_position [S]               — write position(s) along seq dim
+
+    Output: updated cache [B, H, MAX_S, D]
+
+    Equivalent to: cache[:, :, cache_position, :] = new_kv
+    """
+    cache = context.get_input(0)
+    new_kv = context.get_input(1)
+    cache_position = context.get_input(2)
+
+    # ScatterUpdate-3: scatter_update(data, indices, updates, axis)
+    # Updates slices of data along axis at positions given by indices
+    axis = ops.constant(np.int64(2))  # seq dim
+    result = ops.scatter_update(cache, cache_position, new_kv, axis)
+    return result.outputs()
+
+
+def convert_kv_cache_scatter_nd_update(context):
+    """Build ScatterNDUpdate node for KV cache update at cache_position.
+
+    Uses transpose trick: [B,H,S,D] -> [S,B,H,D] so dim 0 is the target,
+    then ScatterNDUpdate with indices [[pos]], then transpose back.
+
+    Inputs: same as convert_kv_cache_scatter_update
+    Output: updated cache [B, H, MAX_S, D]
+    """
+    cache = context.get_input(0)
+    new_kv = context.get_input(1)
+    cache_position = context.get_input(2)
+
+    # Transpose to [MAX_S, B, H, D] so seq dim is first
+    perm_fwd = ops.constant(np.array([2, 0, 1, 3], dtype=np.int64))
+    cache_t = ops.transpose(cache, perm_fwd)
+    new_kv_t = ops.transpose(new_kv, perm_fwd)  # [S, B, H, D]
+
+    # indices: [S] -> [S, 1] for ScatterNDUpdate (last_dim=1, index into dim 0)
+    indices = ops.unsqueeze(cache_position, ops.constant(np.int64(1)))  # [S, 1]
+    # Convert to i64 (ScatterNDUpdate requires i32 or i64 indices)
+    indices = ops.convert(indices, "i64")
+
+    result_t = ops.scatter_nd_update(cache_t, indices, new_kv_t)
+
+    # Transpose back to [B, H, MAX_S, D]
+    perm_back = ops.constant(np.array([1, 2, 0, 3], dtype=np.int64))
+    result = ops.transpose(result_t, perm_back)
+
+    return result.outputs()

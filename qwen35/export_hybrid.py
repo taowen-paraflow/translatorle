@@ -35,9 +35,13 @@ from .export import (
     patched_recurrent_gated_delta_rule,
     qwen3_5_gated_delta_net_forward,
 )
-from .ov_ops import convert_recurrent_attention_cell
+from .ov_ops import convert_recurrent_attention_cell, convert_kv_cache_scatter_update
 
 logger = logging.getLogger(__name__)
+
+# Fixed KV cache size for NPU-compatible static shapes.
+# All attn_block IRs use this as the sequence dimension for KV cache.
+MAX_CACHE_LEN = 256
 
 
 # ---------------------------------------------------------------------------
@@ -54,25 +58,152 @@ class MinimalCacheParams:
 
 
 # ---------------------------------------------------------------------------
-# KV cache for attention layers (same as Phase 1 test_single_attn_npu.py)
+# Fixed-size KV cache for attention layers (ScatterUpdate instead of Concat)
 # ---------------------------------------------------------------------------
 
-class KVCache:
-    """Single-layer KV cache that traces cleanly through ov.convert_model."""
+class FixedKVCache:
+    """Fixed-size KV cache for NPU-compatible static shapes.
 
-    def __init__(self, k, v):
+    Unlike DynamicCache which uses torch.cat (growing output shape P -> P+S),
+    this writes new KV at cache_position into a fixed-size buffer.
+    Input and output shapes are always [B, H, MAX_CACHE_LEN, D].
+
+    Supports multiple update methods to test which OV IR op is fastest on NPU:
+      - 'select': torch.where -> Select op (element-wise conditional)
+      - 'index_copy': torch.index_copy_ -> ScatterUpdate op (axis-based)
+      - 'scatter_elements': torch.scatter -> ScatterElementsUpdate op
+    """
+
+    # Module-level setting, changed by CLI --kv-update-method
+    update_method = "select"
+
+    def __init__(self, k, v, cache_position, scatter_module=None):
+        """
+        Args:
+            k: Key cache [B, H, MAX_CACHE_LEN, D]
+            v: Value cache [B, H, MAX_CACHE_LEN, D]
+            cache_position: Write position(s) [S] int64
+            scatter_module: Optional KVCacheScatterUpdate instance for ext method
+        """
         self.key_cache = [k]
         self.value_cache = [v]
+        self._cache_position = cache_position
+        self._scatter_module = scatter_module
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
-        k = torch.cat([self.key_cache[layer_idx], key_states], dim=2)
-        v = torch.cat([self.value_cache[layer_idx], value_states], dim=2)
+        """Write new KV at cache_position, return full buffer."""
+        method = FixedKVCache.update_method
+        if method == "select":
+            return self._update_select(key_states, value_states, layer_idx)
+        elif method == "index_copy":
+            return self._update_index_copy(key_states, value_states, layer_idx)
+        elif method == "scatter_elements":
+            return self._update_scatter_elements(key_states, value_states, layer_idx)
+        elif method == "scatter_nd":
+            return self._update_scatter_nd(key_states, value_states, layer_idx)
+        elif method == "scatter_update_ext":
+            return self._update_scatter_update_ext(key_states, value_states, layer_idx)
+        else:
+            raise ValueError(f"Unknown KV update method: {method}")
+
+    def _update_select(self, key_states, value_states, layer_idx):
+        """torch.where -> Select op in OV IR."""
+        k = self.key_cache[layer_idx]
+        v = self.value_cache[layer_idx]
+
+        seq_dim = k.shape[2]
+        indices = torch.arange(seq_dim, device=k.device)
+        mask = (indices == self._cache_position.view(-1, 1))
+        mask = mask.any(dim=0)
+        mask = mask.view(1, 1, seq_dim, 1)
+
+        new_k_expanded = key_states.expand(-1, -1, 1, -1).expand_as(k)
+        new_v_expanded = value_states.expand(-1, -1, 1, -1).expand_as(v)
+
+        k = torch.where(mask, new_k_expanded, k)
+        v = torch.where(mask, new_v_expanded, v)
+
+        self.key_cache[layer_idx] = k
+        self.value_cache[layer_idx] = v
+        return k, v
+
+    def _update_index_copy(self, key_states, value_states, layer_idx):
+        """torch.index_copy_ -> ScatterUpdate op in OV IR (axis-based scatter)."""
+        k = self.key_cache[layer_idx]
+        v = self.value_cache[layer_idx]
+
+        # index_copy_(dim, index_1d, source): write source slices at index positions along dim
+        # k: [B, H, MAX_CACHE_LEN, D], key_states: [B, H, S, D], cache_position: [S]
+        k = k.clone()
+        v = v.clone()
+        k.index_copy_(2, self._cache_position, key_states)
+        v.index_copy_(2, self._cache_position, value_states)
+
+        self.key_cache[layer_idx] = k
+        self.value_cache[layer_idx] = v
+        return k, v
+
+    def _update_scatter_elements(self, key_states, value_states, layer_idx):
+        """torch.scatter -> ScatterElementsUpdate op in OV IR."""
+        k = self.key_cache[layer_idx]
+        v = self.value_cache[layer_idx]
+
+        idx = self._cache_position.view(1, 1, -1, 1).expand_as(key_states)
+        k = k.scatter(2, idx, key_states)
+        v = v.scatter(2, idx, value_states)
+
+        self.key_cache[layer_idx] = k
+        self.value_cache[layer_idx] = v
+        return k, v
+
+    def _update_scatter_nd(self, key_states, value_states, layer_idx):
+        """torch.index_put with 4D tensor indices -> ScatterNDUpdate op in OV IR."""
+        k = self.key_cache[layer_idx]
+        v = self.value_cache[layer_idx]
+
+        B, H, S, D = key_states.shape
+        # Build full 4D index tensors so aten::index_put maps to ScatterNDUpdate
+        batch_idx = torch.arange(B, device=k.device).view(-1, 1, 1, 1).expand(B, H, S, D)
+        head_idx = torch.arange(H, device=k.device).view(1, -1, 1, 1).expand(B, H, S, D)
+        seq_idx = self._cache_position.view(1, 1, -1, 1).expand(B, H, S, D)
+        dim_idx = torch.arange(D, device=k.device).view(1, 1, 1, -1).expand(B, H, S, D)
+
+        k = k.index_put((batch_idx, head_idx, seq_idx, dim_idx), key_states)
+        v = v.index_put((batch_idx, head_idx, seq_idx, dim_idx), value_states)
+
+        self.key_cache[layer_idx] = k
+        self.value_cache[layer_idx] = v
+        return k, v
+
+    def _update_scatter_update_ext(self, key_states, value_states, layer_idx):
+        """KVCacheScatterUpdate module -> ScatterUpdate-3 via ConversionExtension."""
+        k = self.key_cache[layer_idx]
+        v = self.value_cache[layer_idx]
+
+        k = self._scatter_module(k, key_states, self._cache_position)
+        v = self._scatter_module(v, value_states, self._cache_position)
+
         self.key_cache[layer_idx] = k
         self.value_cache[layer_idx] = v
         return k, v
 
     def get_seq_length(self, layer_idx=0):
         return self.key_cache[layer_idx].shape[2]
+
+
+class KVCacheScatterUpdate(nn.Module):
+    """Custom module for KV cache scatter update.
+
+    ModuleExtension intercepts this module during ov.convert_model and replaces
+    it with the OV op built by the ConversionExtension callback.
+
+    The forward() runs during tracing for shape inference only.
+    """
+    def forward(self, cache, new_kv, cache_position):
+        # Fallback computation for tracing (shape inference).
+        # ConversionExtension replaces this with ScatterUpdate-3 in the IR.
+        idx = cache_position.view(1, 1, -1, 1).expand_as(new_kv)
+        return cache.scatter(2, idx, new_kv)
 
 
 # ---------------------------------------------------------------------------
@@ -121,21 +252,27 @@ class GDNBlockWrapper(nn.Module):
 
 
 class AttnBlockWrapper(nn.Module):
-    """Wraps 1 attention layer with explicit KV cache I/O.
+    """Wraps 1 attention layer with fixed-size KV cache I/O.
+
+    Uses FixedKVCache (scatter-update) so input and output KV shapes are
+    always [B, H, MAX_CACHE_LEN, D]. This enables MakeStateful on NPU.
 
     Calls the full DecoderLayer.forward() which handles input_layernorm,
     self_attn (with attention_mask), residual, post_attn_layernorm, MLP.
-    Same approach as the working Phase 1 test_single_attn_npu.py.
     """
 
     def __init__(self, layer, rotary_emb):
         super().__init__()
         self.layer = layer
         self.rotary_emb = rotary_emb
+        if FixedKVCache.update_method == "scatter_update_ext":
+            self.kv_scatter = KVCacheScatterUpdate()
+        else:
+            self.kv_scatter = None
 
-    def forward(self, hidden_states, position_ids, key_cache, value_cache, attention_mask):
+    def forward(self, hidden_states, position_ids, key_cache, value_cache, cache_position, attention_mask):
         cos, sin = self.rotary_emb(hidden_states, position_ids)
-        cache = KVCache(key_cache, value_cache)
+        cache = FixedKVCache(key_cache, value_cache, cache_position, self.kv_scatter)
 
         # Call full DecoderLayer forward (handles layernorm, attn, MLP, residuals)
         out = self.layer(
@@ -212,10 +349,13 @@ def _make_dynamic_shapes_gdn(ov_model, in_names, out_names):
 
 
 def _make_dynamic_shapes_attn(ov_model, in_names, out_names):
-    """Set dynamic batch/seq/past dims with shared Symbols on Attn block I/O."""
+    """Set dynamic batch/seq dims on Attn block I/O.
+
+    KV cache dim (MAX_CACHE_LEN) stays STATIC — this is the key change
+    that enables NPU stateful mode (constant state shape).
+    """
     batch_sym = Symbol()
     seq_sym = Symbol()
-    past_sym = Symbol()
 
     for i, name in enumerate(in_names):
         ps = ov_model.inputs[i].partial_shape
@@ -229,15 +369,17 @@ def _make_dynamic_shapes_attn(ov_model, in_names, out_names):
             ps[1] = b; ps[2] = s
         elif name in ("in_key_cache", "in_value_cache"):
             b = Dimension(-1); b.set_symbol(batch_sym)
-            p = Dimension(-1); p.set_symbol(past_sym)
-            ps[0] = b; ps[2] = p
+            ps[0] = b
+            # ps[2] = MAX_CACHE_LEN — STATIC, don't change
+        elif name == "in_cache_position":
+            s = Dimension(-1); s.set_symbol(seq_sym)
+            ps[0] = s
         elif name == "in_attention_mask":
-            # Shape: [B, 1, query_seq, key_seq] where key_seq = past + query
-            # key_seq is an independent dynamic dim (can't express sum of symbols)
+            # Shape: [B, 1, query_seq, MAX_CACHE_LEN] — cache dim is STATIC
             b = Dimension(-1); b.set_symbol(batch_sym)
             s = Dimension(-1); s.set_symbol(seq_sym)
-            ks = Dimension(-1)  # key_seq: independent dynamic dim
-            ps[0] = b; ps[2] = s; ps[3] = ks
+            ps[0] = b; ps[2] = s
+            # ps[3] = MAX_CACHE_LEN — STATIC, don't change
         ov_model.inputs[i].get_node().set_partial_shape(ps)
         ov_model.inputs[i].get_tensor().set_names({name})
 
@@ -308,7 +450,12 @@ def export_gdn_block(layers, layer_indices, group_idx, text_cfg, output_dir):
 
 
 def export_attn_block(layer, rotary_emb, group_idx, text_cfg, output_dir):
-    """Export an attention block (1 layer) to OpenVINO IR."""
+    """Export an attention block (1 layer) to OpenVINO IR.
+
+    Uses FixedKVCache so the IR contains a scatter/select op instead of Concat.
+    KV cache I/O shape is always [B, H, MAX_CACHE_LEN, D].
+    The specific OV op depends on FixedKVCache.update_method.
+    """
     attn_layer_idx = layer.self_attn.layer_idx
     logger.info("Exporting Attn block %d (layer %d) ...", group_idx, attn_layer_idx)
 
@@ -323,25 +470,47 @@ def export_attn_block(layer, rotary_emb, group_idx, text_cfg, output_dir):
     num_kv_heads = text_cfg.num_key_value_heads
     head_dim = getattr(text_cfg, "head_dim", hidden_size // text_cfg.num_attention_heads)
 
-    # B=1, S=1, P=2 (decode step)
-    B, S, P = 1, 1, 2
+    # B=1, S=1, cache_pos=5 (arbitrary decode position for tracing)
+    B, S = 1, 1
+    cache_pos = 5
     dummy = {
         "hidden_states": torch.randn(B, S, hidden_size),
-        "position_ids": torch.full((3, B, S), P, dtype=torch.int64),
-        "key_cache": torch.randn(B, num_kv_heads, P, head_dim) * 0.01,
-        "value_cache": torch.randn(B, num_kv_heads, P, head_dim) * 0.01,
-        # 4D causal mask: [B, 1, query_seq, key_seq] where key_seq = past + query
-        # 0.0 = attend, large negative = ignore
-        "attention_mask": torch.zeros(B, 1, S, P + S, dtype=torch.float32),
+        "position_ids": torch.full((3, B, S), cache_pos, dtype=torch.int64),
+        "key_cache": torch.randn(B, num_kv_heads, MAX_CACHE_LEN, head_dim) * 0.01,
+        "value_cache": torch.randn(B, num_kv_heads, MAX_CACHE_LEN, head_dim) * 0.01,
+        "cache_position": torch.tensor([cache_pos], dtype=torch.int64),
+        # 4D mask: [B, 1, query_seq, MAX_CACHE_LEN]  0.0=attend, -65504=ignore
+        "attention_mask": torch.zeros(B, 1, S, MAX_CACHE_LEN, dtype=torch.float32),
     }
 
-    with torch.no_grad():
-        ov_model = ov.convert_model(wrapper, example_input=dummy)
+    # Build extensions list for ConversionExtension-based KV update methods
+    extensions = []
+    if FixedKVCache.update_method == "scatter_update_ext":
+        extensions.append(ModuleExtension(KVCacheScatterUpdate, "KVCacheScatterUpdateOp"))
+        extensions.append(ConversionExtension("KVCacheScatterUpdateOp", convert_kv_cache_scatter_update))
 
-    # Use in_/out_ prefixes to avoid OV tensor sharing issues
-    in_names = ["in_hidden", "in_position_ids", "in_key_cache", "in_value_cache", "in_attention_mask"]
+    with torch.no_grad():
+        ov_model = ov.convert_model(
+            wrapper, example_input=dummy,
+            extension=extensions if extensions else None,
+        )
+
+    in_names = ["in_hidden", "in_position_ids", "in_key_cache", "in_value_cache",
+                "in_cache_position", "in_attention_mask"]
     out_names = ["out_hidden", "out_key_cache", "out_value_cache"]
     _make_dynamic_shapes_attn(ov_model, in_names, out_names)
+
+    # Report KV update ops in the IR
+    selects = [op for op in ov_model.get_ops() if op.get_type_name() == "Select"]
+    scatter_types = {}
+    for op in ov_model.get_ops():
+        name = op.get_type_name()
+        if "Scatter" in name:
+            scatter_types[name] = scatter_types.get(name, 0) + 1
+    concats = [op for op in ov_model.get_ops() if op.get_type_name() == "Concat"]
+    logger.info("  KV update method: %s", FixedKVCache.update_method)
+    logger.info("  Select ops: %d, Scatter ops: %s, Concat ops: %d",
+                len(selects), dict(scatter_types) if scatter_types else 0, len(concats))
 
     # Verify no Loop nodes
     loops = [op for op in ov_model.get_ops() if op.get_type_name() in ("Loop", "TensorIterator")]
@@ -474,6 +643,13 @@ if __name__ == "__main__":
         "--output-dir", default="models/qwen35/Qwen3.5-0.8B-hybrid",
         help="Output directory for IR files",
     )
+    parser.add_argument(
+        "--kv-update-method", default="select",
+        choices=["select", "index_copy", "scatter_elements", "scatter_nd", "scatter_update_ext"],
+        help="KV cache update method: select (torch.where), index_copy (torch.index_copy_), scatter_elements (torch.scatter), scatter_nd (torch.index_put), scatter_update_ext (ConversionExtension -> ScatterUpdate-3)",
+    )
     args = parser.parse_args()
 
+    FixedKVCache.update_method = args.kv_update_method
+    logger.info("KV update method: %s", args.kv_update_method)
     export_hybrid_subgraphs(args.model_dir, args.output_dir)
