@@ -206,8 +206,8 @@ NPU stateful（ReadValue/Assign）在子图模式下有固有开销：
 #### 待尝试优化
 
 6. **Async pipeline** — GDN（GPU）和 Attn（NPU）目前串行执行。理论上可用 `start_async()` 做 overlap：当 NPU 推理 attn_block_i 时，GPU 可预热 gdn_block_{i+1}。但 pipeline 设计需要小心依赖关系
-7. **KV cache INT8 量化** — `nncf.compress_weights()` 对 attention block IR 的 KV cache 做 INT8 量化，减少 NPU explicit I/O 传输量（从 ~1MB/block 降到 ~0.5MB）
-8. **Attention block 权重 INT4** — 对 NPU attention block 做 INT4_SYM 量化（0.8B 模型可能反而更慢，需实测）
+7. ~~**KV cache INT8 量化**~~ → 权重量化已提供足够压缩和加速，KV cache 量化优先级降低
+8. ✓ **Attention block 权重 INT4** → 已验证 INT4_SYM 安全，见量化实验结果
 9. ~~**Batch prefill**~~ → 已实现为 **Chunked prefill**（见已验证 #4）
 
 #### 瓶颈分析（profiling 实测，含 profiling overhead）
@@ -226,6 +226,37 @@ NPU stateful（ReadValue/Assign）在子图模式下有固有开销：
 
 主要瓶颈是 GDN blocks（占 65-70%）。NPU attn blocks 已经比 GPU 快，但 GDN 占绝对主导。
 
+### 量化实验结果
+
+**工具**:
+- `qwen35/scripts/quantize_hybrid.py` — 对已导出的 hybrid IR 做 per-subgraph NNCF 权重压缩
+- `qwen35/scripts/test_quality.py` — 6 个多样 prompt 质量对比测试
+
+**量化配方**:
+```powershell
+# 推荐：全量化（Attn INT4 + GDN INT8 + Head INT4）
+uv run python -m qwen35.scripts.quantize_hybrid --attn-mode int4_sym --gdn-mode int8_sym --head-mode int4_sym
+# 质量测试（与 FP16 baseline 对比）
+uv run python -m qwen35.scripts.test_quality --model-dir models/qwen35/Qwen3.5-0.8B-hybrid-attn-int4sym-gdn-int8sym-head-int4sym --baseline-dir models/qwen35/Qwen3.5-0.8B-hybrid
+```
+
+**测试结果（6 prompt, HYBRID NPU+GPU, 80 tokens/prompt）**:
+
+| 配置 | 模型大小 | Avg Decode tok/s | 质量偏差 |
+|------|---------|-----------------|---------|
+| FP16 baseline | 5.5 GB | ~13.6 | — |
+| Attn INT4_SYM only | 5.3 GB | ~13.3 | 1/6 divergent（factual_cn，仍正确） |
+| Attn INT4 + Head INT4 | 4.8 GB | ~13.8 | 1/6 divergent（factual_cn，仍正确） |
+| **Attn INT4 + GDN INT8 + Head INT4** | **4.1 GB** | **~14.5** | 2/6 divergent（语义正确） |
+
+**关键发现**:
+- **GDN INT8_SYM 安全** — 递归精度未受影响，reasoning prompt（数学题）输出与 baseline 完全一致
+- **Attn INT4_SYM 安全** — 标准 Transformer 对 INT4 鲁棒性好，NPU 上 INT4_SYM 是最优精度
+- **Head INT4_SYM** — NNCF 对 248k vocab 投影做 INT4，减少 ~700MB
+- **全量化比 FP16 更快** — GPU 带宽减半，decode 从 ~13.6 提升到 ~14.5 tok/s
+- **divergent ≠ 错误** — 偏差仅在措辞上（如"北京"回答方式不同），语义完全正确
+- **推荐配方**: `--attn-mode int4_sym --gdn-mode int8_sym --head-mode int4_sym`
+
 ### 模块说明
 
 | 模块 | 职责 |
@@ -234,6 +265,8 @@ NPU stateful（ReadValue/Assign）在子图模式下有固有开销：
 | `inference_hybrid.py` | `Qwen35HybridModel` — 编排 13 子图推理，GDN stateful + Attn explicit I/O，chunked prefill (S=16) |
 | `cpp/` | C++ hybrid 推理（同架构，16-18 tok/s decode），见下方 |
 | `scripts/run_inference.py` | 统一入口，`--device HYBRID/GPU_ONLY/CPU_ONLY` |
+| `scripts/quantize_hybrid.py` | Per-subgraph NNCF 权重量化（Attn INT4 / GDN INT8 / Head INT4） |
+| `scripts/test_quality.py` | 6 prompt 质量对比测试，支持 baseline side-by-side |
 
 ### C++ Hybrid 推理
 
