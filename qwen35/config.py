@@ -156,15 +156,32 @@ QWEN35_4B_GPU = Qwen35ModelConfig(
 QWEN35_MODEL_CPU = QWEN35_08B_CPU if MODEL_SIZE == "0.8B" else QWEN35_4B_CPU
 QWEN35_MODEL_GPU = QWEN35_08B_GPU if MODEL_SIZE == "0.8B" else QWEN35_4B_GPU
 
+QWEN35_08B_HETERO = Qwen35ModelConfig(
+    model_xml=str(_ov_dir("0.8B") / "openvino_model.xml"),
+    hf_model_id="Qwen/Qwen3.5-0.8B",
+    device="HETERO",
+)
+
+QWEN35_4B_HETERO = Qwen35ModelConfig(
+    model_xml=str(_ov_dir("4B") / "openvino_model.xml"),
+    hf_model_id="Qwen/Qwen3.5-4B",
+    device="HETERO",
+)
+
+QWEN35_MODEL_HETERO = QWEN35_08B_HETERO if MODEL_SIZE == "0.8B" else QWEN35_4B_HETERO
+
 QWEN35_MODELS = {
     # Keyed by "<size>-<device>" for explicit selection
     "0.8B-CPU": QWEN35_08B_CPU,
     "0.8B-GPU": QWEN35_08B_GPU,
+    "0.8B-HETERO": QWEN35_08B_HETERO,
     "4B-CPU":   QWEN35_4B_CPU,
     "4B-GPU":   QWEN35_4B_GPU,
+    "4B-HETERO": QWEN35_4B_HETERO,
     # Legacy keys (resolve from MODEL_SIZE)
     "CPU": QWEN35_MODEL_CPU,
     "GPU": QWEN35_MODEL_GPU,
+    "HETERO": QWEN35_MODEL_HETERO,
 }
 
 DEFAULT_QWEN35_MODEL = "GPU"

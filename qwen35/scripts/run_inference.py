@@ -73,7 +73,7 @@ def main():
     parser.add_argument(
         "--device",
         default="CPU",
-        help="OpenVINO device (CPU, GPU)",
+        help="OpenVINO device (CPU, GPU, HETERO for GPU+NPU hybrid)",
     )
     parser.add_argument(
         "--temperature",

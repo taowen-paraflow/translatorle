@@ -210,6 +210,57 @@ class Qwen35OVModel(GenerationMixin):
     # from_pretrained
     # -----------------------------------------------------------------
 
+    @staticmethod
+    def _set_hybrid_affinity(ov_model, num_hidden_layers: int, full_attention_interval: int = 4):
+        """Set per-op device affinity for HETERO:GPU,NPU compilation.
+
+        GDN layers (with Loop nodes) -> GPU
+        Attention layers (standard SDPA) -> NPU
+        Non-layer ops (embed, lm_head, etc.) -> GPU
+        """
+        # Compute attention layer indices: e.g. [3, 7, 11, 15, 19, 23] for 24 layers
+        attn_layer_indices = {
+            i for i in range(num_hidden_layers)
+            if (i + 1) % full_attention_interval == 0
+        }
+        attn_prefixes = [f".layers.{i}." for i in attn_layer_indices]
+
+        gpu_count = 0
+        npu_count = 0
+
+        for op in ov_model.get_ops():
+            friendly_name = op.get_friendly_name()
+            type_name = op.get_type_name()
+
+            affinity = "GPU"
+
+            # Check if this op belongs to an attention layer
+            for prefix in attn_prefixes:
+                if prefix in friendly_name:
+                    affinity = "NPU"
+                    break
+
+            # ReadValue/Assign for KV cache -> NPU
+            if type_name in ("ReadValue", "Assign"):
+                try:
+                    var_id = op.get_attributes().get("variable_id", "")
+                except Exception:
+                    var_id = ""
+                if ".key." in var_id or ".value." in var_id:
+                    affinity = "NPU"
+
+            op.get_rt_info()["affinity"] = affinity
+            if affinity == "NPU":
+                npu_count += 1
+            else:
+                gpu_count += 1
+
+        logger.info(
+            "HETERO affinity: %d ops -> GPU, %d ops -> NPU "
+            "(attention layers: %s)",
+            gpu_count, npu_count, sorted(attn_layer_indices),
+        )
+
     @classmethod
     def from_pretrained(
         cls,
@@ -226,7 +277,8 @@ class Qwen35OVModel(GenerationMixin):
             Directory containing ``openvino_model.xml`` (and ``.bin``), plus
             ``config.json``.
         device:
-            OpenVINO device string, e.g. ``"CPU"``, ``"GPU"``.
+            OpenVINO device string, e.g. ``"CPU"``, ``"GPU"``,
+            ``"HETERO"`` (GPU+NPU hybrid: GDN on GPU, attention on NPU).
         tokenizer_path:
             Path to the tokenizer.  Defaults to *model_path* (works when the
             tokenizer files live next to the IR).
@@ -241,29 +293,40 @@ class Qwen35OVModel(GenerationMixin):
         core = ov.Core()
         ov_model = core.read_model(str(xml_path))
 
+        # Determine actual compile device
+        is_hetero = device.upper() == "HETERO"
+        compile_device = "HETERO:GPU,NPU" if is_hetero else device
+
         # The IR is saved with FP16 compression, so outputs are f16.
         # CPU auto-promotes to f32, but GPU and NPU do not -- add a
         # PrePostProcessor pass to convert outputs to f32 explicitly.
-        if device in ("GPU", "NPU"):
+        if device in ("GPU", "NPU") or is_hetero:
             from openvino.preprocess import PrePostProcessor
             ppp = PrePostProcessor(ov_model)
             for i in range(len(ov_model.outputs)):
                 ppp.output(i).tensor().set_element_type(ov.Type.f32)
             ov_model = ppp.build()
 
-        compile_props = ov_config or {}
-        compiled = core.compile_model(ov_model, device, compile_props)
-        request = compiled.create_infer_request()
-
+        # Load config early -- needed for HETERO affinity
         try:
             config = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True)
         except (ValueError, KeyError):
-            # Fallback for older transformers that don't know "qwen3_5"
             import json
             with open(model_path / "config.json") as f:
                 cfg_dict = json.load(f)
             from transformers import PretrainedConfig
             config = PretrainedConfig(**cfg_dict)
+
+        # HETERO: set per-op affinity before compilation
+        if is_hetero:
+            num_hidden = getattr(config, "num_hidden_layers", 24)
+            text_cfg = getattr(config, "text_config", config)
+            full_attn_interval = getattr(text_cfg, "full_attention_interval", 4)
+            cls._set_hybrid_affinity(ov_model, num_hidden, full_attn_interval)
+
+        compile_props = ov_config or {}
+        compiled = core.compile_model(ov_model, compile_device, compile_props)
+        request = compiled.create_infer_request()
 
         tok_path = str(tokenizer_path) if tokenizer_path else str(model_path)
         tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
