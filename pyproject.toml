@@ -13,7 +13,7 @@ dependencies = [
     # Model export (only needed for prepare_asr_models.py)
     "torch",
     "torchaudio",
-    "optimum[openvino]",
+    "optimum[openvino]<2",
     "nncf>=3.0",
     # MT module: openvino_genai for LLMPipeline
     "openvino-genai>=2026.0.0.0",
@@ -24,6 +24,7 @@ dependencies = [
     "sounddevice",
     "python-dateutil>=2.9.0.post0",
     "protobuf>=5.29,<6",
+    "pillow>=12.1.1",
 ]
 
 [tool.uv]

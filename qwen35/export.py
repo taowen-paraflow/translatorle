@@ -389,12 +389,15 @@ def _generate_dummy_inputs(
     cache_params: List[torch.Tensor] = []
 
     # Linear attention layers: conv_states + recurrent_states
+    # After repeat_interleave in the GDN forward, both key and query are
+    # expanded to num_v_heads.  The recurrent state S = k outer delta has
+    # shape (B, num_v_heads, key_head_dim, value_head_dim).
     for _ in range(num_linear):
         conv_state = torch.zeros(batch_size, conv_dim, linear_conv_kernel_dim, dtype=torch.float32)
         cache_params.append(conv_state)
 
         recurrent_state = torch.zeros(
-            batch_size, linear_num_key_heads, linear_key_head_dim, linear_value_head_dim,
+            batch_size, linear_num_value_heads, linear_key_head_dim, linear_value_head_dim,
             dtype=torch.float32,
         )
         cache_params.append(recurrent_state)

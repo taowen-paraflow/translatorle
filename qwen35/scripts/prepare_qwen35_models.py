@@ -17,7 +17,7 @@ _QWEN35_DIR = _SCRIPT_DIR.parent
 _PROJECT_DIR = _QWEN35_DIR.parent
 sys.path.insert(0, str(_PROJECT_DIR))
 
-from qwen35.config import MODELS_DIR
+from qwen35.config import MODELS_DIR, ARCH_CONFIGS
 
 log = logging.getLogger("prepare_qwen35")
 
@@ -40,8 +40,14 @@ def main():
     )
     parser.add_argument(
         "--hf-model",
-        default="Qwen/Qwen3.5-0.8B",
-        help="HuggingFace model ID or local path (default: %(default)s)",
+        default=None,
+        help="HuggingFace model ID or local path (default: auto from --model-size)",
+    )
+    parser.add_argument(
+        "--model-size",
+        default="0.8B",
+        choices=list(ARCH_CONFIGS.keys()),
+        help="Model size (default: %(default)s)",
     )
     parser.add_argument(
         "--skip-existing",
@@ -62,17 +68,19 @@ def main():
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
+    arch = ARCH_CONFIGS[args.model_size]
+    hf_model = args.hf_model or arch["hf_model_id"]
+
     t0 = time.time()
 
     # Step 1: Download model
     print("\n" + "=" * 60)
     print("STEP 1: DOWNLOAD MODEL")
     print("=" * 60)
-    hf_model_dir = resolve_hf_model(args.hf_model)
+    hf_model_dir = resolve_hf_model(hf_model)
 
     # Step 2: Export to OpenVINO
-    model_name = Path(args.hf_model).name
-    output_dir = MODELS_DIR / f"{model_name}-ov"
+    output_dir = MODELS_DIR / arch["ov_dir_name"]
 
     if args.skip_existing and (output_dir / "openvino_model.xml").exists():
         print(f"\n[Step 2] Skipping export — {output_dir} already exists")

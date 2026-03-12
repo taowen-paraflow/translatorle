@@ -357,7 +357,11 @@ class Qwen35OVModel(GenerationMixin):
             }
 
             if "attention_mask" in self._input_names:
-                inp["attention_mask"] = np.ones((batch_size, 1), dtype=np.int64)
+                # Full-context mask: the full_attention layers need to know
+                # the entire past context to construct the correct causal mask
+                # for attending to the KV cache.
+                total_len = self._past_length + 1
+                inp["attention_mask"] = np.ones((batch_size, total_len), dtype=np.int64)
 
             if "position_ids" in self._input_names:
                 pos = self._past_length

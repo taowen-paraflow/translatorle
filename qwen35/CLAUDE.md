@@ -47,11 +47,11 @@ Qwen3.5 使用 **Gated Delta Networks (GDN) 混合架构**，不是标准 Transf
 
 ## 设备兼容性
 
-| 设备 | 状态 | 速度 | 备注 |
-|------|------|------|------|
-| CPU | 正常 | 10-14 tok/s | 推荐 |
-| GPU | 正常 | 6-11 tok/s | `INFERENCE_PRECISION_HINT: f16`，同一份 IR |
-| NPU | **不可用（FP16精度不足）** | — | GDN 递归 state 在 FP16 下累积误差发散 |
+| 设备 | 状态 | FP16 速度 | INT4 速度 | 备注 |
+|------|------|-----------|-----------|------|
+| CPU | 正常 | 5.0 tok/s | — | 稳定 |
+| GPU | **正常** | 8.2 tok/s | **12-13 tok/s** | ScatterUpdate bug 已修复 |
+| NPU | **不可用** | — | — | GDN 递归 FP16 精度不足 |
 
 **NPU 结论**：Intel NPU 硬件精度固定 FP16，GDN delta rule 线性递归 `S_t = S_{t-1} * exp(g_t) + outer(k_t, delta_t)` 每步乘法放大舍入误差，18 层串联后 logit 快速发散。已验证多种方案（NPUW_LLM、混合 Shadow FP32、多子图 4 层分组）均无法解决。CPU/GPU 是推荐设备。详见 `intel-npu-gdn.md`。
 

@@ -9,6 +9,7 @@ dependencies = [
     "transformers>=5.0",
     "torch",
     "huggingface-hub",
+    "modelscope>=1.34.0",
 ]
 
 [tool.uv]
