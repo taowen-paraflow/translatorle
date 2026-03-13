@@ -26,14 +26,14 @@ Qwen35HybridModel::Qwen35HybridModel(
     const std::string& tokenizers_lib,
     bool use_latency_hint,
     bool no_gdn_prefill,
-    int mtp_steps)
+    bool timing)
     : attn_past_seq_(attn_past_seq),
       prefill_chunk_size_(prefill_chunk_size),
       past_length_(0),
       kv_total_(0),
       use_latency_hint_(use_latency_hint),
       no_gdn_prefill_(no_gdn_prefill),
-      mtp_steps_(mtp_steps)
+      timing_(timing)
 {
     cfg_ = load_config(model_dir);
     log("Config: hidden=" + std::to_string(cfg_.hidden_size) +
@@ -60,9 +60,6 @@ Qwen35HybridModel::Qwen35HybridModel(
         log("Skipping GDN prefill blocks (--no-gdn-prefill)");
     }
     load_embeddings(model_dir);
-    if (mtp_steps_ > 0) {
-        load_mtp_block(model_dir);
-    }
     alloc_buffers();
     bind_decode_tensors();
 
@@ -134,21 +131,8 @@ std::shared_ptr<ov::Model> Qwen35HybridModel::add_f32_output_conversion(
 // ---------------------------------------------------------------------------
 
 void Qwen35HybridModel::load_gdn_blocks(const std::string& model_dir) {
-    // Prefer S1 (no-Loop) blocks for decode if available.
-    // S1 blocks only support S=1, so they require prefill blocks for the
-    // prefill phase (S>1). If prefill blocks won't be loaded (--no-gdn-prefill),
-    // the Loop-based blocks are used as fallback since they support any S.
-    bool s1_exists = fs::exists(model_dir + "/gdn_s1_block_0.xml");
-    bool prefill_exists = fs::exists(model_dir + "/gdn_prefill_block_0.xml");
-    bool use_s1 = s1_exists && prefill_exists && !no_gdn_prefill_;
-
-    if (s1_exists && !use_s1) {
-        log("S1 GDN blocks found but not using: prefill blocks required for S>1 fallback");
-    }
-
-    std::string block_type = use_s1 ? "S1 no-Loop" : "Loop-based";
-    log("Compiling " + std::to_string(cfg_.num_blocks) + " GDN " + block_type +
-        " blocks on GPU (stateful)...");
+    log("Compiling " + std::to_string(cfg_.num_blocks) +
+        " GDN Loop-based blocks on GPU (stateful)...");
     auto t0 = std::chrono::steady_clock::now();
 
     // 3 layers per block × (conv + rec) = 6 state pairs
@@ -159,16 +143,10 @@ void Qwen35HybridModel::load_gdn_blocks(const std::string& model_dir) {
     }
 
     for (int i = 0; i < cfg_.num_blocks; ++i) {
-        std::string xml = use_s1
-            ? model_dir + "/gdn_s1_block_" + std::to_string(i) + ".xml"
-            : model_dir + "/gdn_block_" + std::to_string(i) + ".xml";
+        std::string xml = model_dir + "/gdn_block_" + std::to_string(i) + ".xml";
         auto model = core_.read_model(xml);
-        bool make_stateful = !use_s1 || (mtp_steps_ == 0);
-        if (make_stateful) {
-            // Stateful: state lives in GPU VRAM (faster ~15%, but can't read state back)
-            ov::pass::MakeStateful(state_map).run_on_model(model);
-        }
-        // S1 + MTP: keep explicit I/O (state in host memory, enables batch verify)
+        // Stateful: state lives in GPU VRAM (faster ~15%)
+        ov::pass::MakeStateful(state_map).run_on_model(model);
         model = add_f32_output_conversion(model);
         ov::AnyMap gpu_config = {
             {ov::hint::num_requests.name(), uint32_t(1)}
@@ -181,18 +159,8 @@ void Qwen35HybridModel::load_gdn_blocks(const std::string& model_dir) {
         gdn_requests_.push_back(compiled.create_infer_request());
     }
 
-    // has_gdn_s1_ = true means S1 blocks with explicit I/O (state in host memory).
-    // Only enable when MTP is active (needed for batch verify).
-    // When MTP is off, S1 blocks are stateful (faster, ~15% less GDN overhead).
-    has_gdn_s1_ = use_s1 && (mtp_steps_ > 0);
-    if (has_gdn_s1_) {
-        // S1 explicit I/O: allocate shared state buffers (used by both decode and prefill)
-        init_gdn_prefill_states();
-    } else {
-        init_gdn_states();
-    }
-    log("  GDN compilation: " + std::to_string(elapsed_ms(t0)) + " ms" +
-        (use_s1 ? " (S1 no-Loop)" : " (Loop-based)"));
+    init_gdn_states();
+    log("  GDN compilation: " + std::to_string(elapsed_ms(t0)) + " ms (Loop-based)");
 }
 
 // ---------------------------------------------------------------------------
@@ -416,125 +384,6 @@ void Qwen35HybridModel::init_kv_caches() {
 }
 
 // ---------------------------------------------------------------------------
-// MTP block loading (GPU, explicit I/O KV cache)
-// ---------------------------------------------------------------------------
-
-void Qwen35HybridModel::load_mtp_block(const std::string& model_dir) {
-    std::string mtp_xml = model_dir + "/mtp_block.xml";
-    if (!fs::exists(mtp_xml)) {
-        log("WARNING: mtp_block.xml not found, MTP disabled");
-        has_mtp_ = false;
-        mtp_steps_ = 0;
-        return;
-    }
-
-    log("Compiling MTP block on GPU...");
-    auto t0 = std::chrono::steady_clock::now();
-
-    auto model = core_.read_model(mtp_xml);
-    model = add_f32_output_conversion(model);
-    ov::AnyMap gpu_config = {
-        {ov::hint::num_requests.name(), uint32_t(1)}
-    };
-    if (use_latency_hint_) {
-        gpu_config[ov::hint::performance_mode.name()] = ov::hint::PerformanceMode::LATENCY;
-    }
-    mtp_model_ = core_.compile_model(model, "GPU", gpu_config);
-    mtp_request_ = mtp_model_.create_infer_request();
-
-    // MTP KV cache: [1, num_kv_heads, max_cache_len, head_dim]
-    // For Qwen3.5-0.8B: num_kv_heads=2, head_dim=256, max_cache_len=attn_past_seq_
-    int mtp_kv_heads = cfg_.num_kv_heads;  // 2
-    int mtp_head_dim = cfg_.head_dim;      // 256
-    int mtp_cache_len = attn_past_seq_;    // 256
-    mtp_kv_total_ = mtp_kv_heads * mtp_cache_len * mtp_head_dim;
-
-    mtp_kv_key_ = ov::Tensor(ov::element::f32,
-        {1, static_cast<size_t>(mtp_kv_heads),
-         static_cast<size_t>(mtp_cache_len),
-         static_cast<size_t>(mtp_head_dim)});
-    mtp_kv_value_ = ov::Tensor(ov::element::f32,
-        {1, static_cast<size_t>(mtp_kv_heads),
-         static_cast<size_t>(mtp_cache_len),
-         static_cast<size_t>(mtp_head_dim)});
-    std::memset(mtp_kv_key_.data<float>(), 0, mtp_kv_total_ * sizeof(float));
-    std::memset(mtp_kv_value_.data<float>(), 0, mtp_kv_total_ * sizeof(float));
-    mtp_past_length_ = 0;
-
-    // Allocate MTP buffers
-    int H = cfg_.hidden_size;
-    mtp_hidden_buf_.resize(H, 0.0f);
-    mtp_saved_hidden_.resize(H, 0.0f);
-    mtp_embeds_buf_.resize(H, 0.0f);
-    mtp_pos_buf_.resize(3, 0LL);
-    mtp_cache_pos_buf_.resize(1, 0LL);
-    mtp_mask_buf_.resize(mtp_cache_len, -65504.0f);
-
-    // Create tensor wrappers
-    mtp_hidden_tensor_ = ov::Tensor(ov::element::f32,
-        {1, 1, static_cast<size_t>(H)}, mtp_hidden_buf_.data());
-    mtp_embeds_tensor_ = ov::Tensor(ov::element::f32,
-        {1, 1, static_cast<size_t>(H)}, mtp_embeds_buf_.data());
-    mtp_pos_tensor_ = ov::Tensor(ov::element::i64, {3, 1, 1}, mtp_pos_buf_.data());
-    mtp_cache_pos_tensor_ = ov::Tensor(ov::element::i64, {1}, mtp_cache_pos_buf_.data());
-    mtp_mask_tensor_ = ov::Tensor(ov::element::f32,
-        {1, 1, 1, static_cast<size_t>(mtp_cache_len)}, mtp_mask_buf_.data());
-
-    // Bind MTP tensors
-    mtp_request_.set_input_tensor(0, mtp_hidden_tensor_);   // in_hidden
-    mtp_request_.set_input_tensor(1, mtp_embeds_tensor_);   // in_embeds
-    mtp_request_.set_input_tensor(2, mtp_pos_tensor_);      // in_position_ids
-    mtp_request_.set_input_tensor(3, mtp_kv_key_);          // in_mtp_key_cache
-    mtp_request_.set_input_tensor(4, mtp_kv_value_);        // in_mtp_value_cache
-    mtp_request_.set_input_tensor(5, mtp_cache_pos_tensor_); // in_cache_position
-    mtp_request_.set_input_tensor(6, mtp_mask_tensor_);     // in_attention_mask
-
-    // Allocate GDN state snapshots for rollback
-    gdn_snapshots_.resize(cfg_.num_blocks);
-    if (has_gdn_s1_) {
-        // S1 explicit I/O: 6 states per block (conv0, rec0, conv1, rec1, conv2, rec2)
-        for (int blk = 0; blk < cfg_.num_blocks; ++blk) {
-            gdn_snapshots_[blk].states.resize(6);
-            for (int j = 0; j < 3; ++j) {
-                gdn_snapshots_[blk].states[j * 2] = ov::Tensor(ov::element::f32,
-                    gdn_prefill_conv_states_[blk][j].get_shape());
-                gdn_snapshots_[blk].states[j * 2 + 1] = ov::Tensor(ov::element::f32,
-                    gdn_prefill_rec_states_[blk][j].get_shape());
-            }
-        }
-    } else {
-        // Stateful: query GPU state vars for shapes
-        for (int blk = 0; blk < cfg_.num_blocks; ++blk) {
-            auto states = gdn_requests_[blk].query_state();
-            gdn_snapshots_[blk].states.resize(states.size());
-            for (size_t j = 0; j < states.size(); ++j) {
-                auto st = states[j].get_state();
-                gdn_snapshots_[blk].states[j] = ov::Tensor(st.get_element_type(), st.get_shape());
-            }
-        }
-    }
-
-    // Load norm correction vector: model.norm.weight / mtp.norm.weight
-    // This corrects the MTP output (which has mtp.norm) before feeding to
-    // the head block (which applies model.norm + lm_head).
-    std::string correction_path = model_dir + "/mtp_norm_correction.npy";
-    if (fs::exists(correction_path)) {
-        std::vector<size_t> shape;
-        mtp_norm_correction_ = load_npy_fp32(correction_path, shape);
-        log("  Loaded norm correction: " + std::to_string(mtp_norm_correction_.size()) + " elements");
-    } else {
-        log("  WARNING: mtp_norm_correction.npy not found, using CPU lm_head fallback");
-    }
-
-    has_mtp_ = true;
-    log("  MTP compilation: " + std::to_string(elapsed_ms(t0)) + " ms");
-    log("  MTP KV cache: [1, " + std::to_string(mtp_kv_heads) + ", " +
-        std::to_string(mtp_cache_len) + ", " + std::to_string(mtp_head_dim) + "]");
-    log("  GDN snapshots: " + std::to_string(cfg_.num_blocks) + " blocks, " +
-        std::to_string(gdn_snapshots_[0].states.size()) + " states/block");
-}
-
-// ---------------------------------------------------------------------------
 // Pre-allocate buffers and tensor wrappers
 // ---------------------------------------------------------------------------
 
@@ -550,6 +399,10 @@ void Qwen35HybridModel::alloc_buffers() {
     pos_buf_.resize(3 * max_seq, 0LL);
     cache_pos_buf_.resize(max_seq, 0LL);
     attn_mask_buf_.resize(max_seq * P, 0.0f);
+
+    // Pre-allocate prefill buffers (max prompt = attn_past_seq tokens, one alloc at init)
+    prefill_hidden_buf_.resize(P * H, 0.0f);
+    prefill_gdn_mask_.assign(P, 1LL);
 
     // Create tensor wrappers for decode (S=1) — wraps raw buffers, no copy
     s1_hidden_ = ov::Tensor(ov::element::f32, {1, 1, static_cast<size_t>(H)}, hidden_buf_.data());
@@ -588,9 +441,6 @@ void Qwen35HybridModel::alloc_buffers() {
 // ---------------------------------------------------------------------------
 
 void Qwen35HybridModel::init_gdn_states() {
-    // S1 explicit I/O: states are in gdn_prefill_*_states_ buffers, no GPU state vars
-    if (has_gdn_s1_) return;
-
     int conv_size = cfg_.conv_dim * cfg_.conv_kernel;
     int rec_size = cfg_.num_v_heads * cfg_.k_head_dim * cfg_.v_head_dim;
 
@@ -655,9 +505,6 @@ void Qwen35HybridModel::init_gdn_prefill_states() {
 // ---------------------------------------------------------------------------
 
 void Qwen35HybridModel::transfer_prefill_states_to_decode() {
-    // S1 explicit I/O: decode and prefill share the same state buffers, no transfer needed
-    if (has_gdn_s1_) return;
-
     for (int blk = 0; blk < cfg_.num_blocks; ++blk) {
         for (auto& s : gdn_requests_[blk].query_state()) {
             std::string name = s.get_name();
@@ -676,6 +523,21 @@ void Qwen35HybridModel::transfer_prefill_states_to_decode() {
 }
 
 // ---------------------------------------------------------------------------
+// Initialize decode attention mask for incremental updates.
+// Sets positions [0..past_length_] to 0.0 (attend) and rest to -65504.0 (mask).
+// After this, each decode step only writes one float: mask[past_length_] = 0.0f.
+// ---------------------------------------------------------------------------
+
+void Qwen35HybridModel::init_decode_attn_mask() {
+    const float MASK_VAL = -65504.0f;
+    int P = attn_past_seq_;
+    float* mask = attn_mask_buf_.data();
+    int valid = std::min(past_length_ + 1, P);
+    std::memset(mask, 0, valid * sizeof(float));
+    std::fill_n(mask + valid, P - valid, MASK_VAL);
+}
+
+// ---------------------------------------------------------------------------
 // Pre-bind decode tensors (S=1) — call once after alloc_buffers()
 // Avoids 55+ set_input/output_tensor calls per decode step.
 // Only position_ids, cache_position, and attn_mask content change per step.
@@ -688,18 +550,6 @@ void Qwen35HybridModel::bind_decode_tensors() {
         gdn_req.set_input_tensor(1, s1_gdn_mask_);
         gdn_req.set_output_tensor(0, s1_hidden_);
 
-        if (has_gdn_s1_) {
-            // S1 explicit I/O: bind state tensors (shared with prefill).
-            // Output states point to same buffer as input: GPU copies in before
-            // processing, writes out after. Same pattern as hidden zero-copy.
-            for (int j = 0; j < 3; ++j) {
-                gdn_req.set_input_tensor(2 + j * 2, gdn_prefill_conv_states_[i][j]);
-                gdn_req.set_input_tensor(3 + j * 2, gdn_prefill_rec_states_[i][j]);
-                gdn_req.set_output_tensor(1 + j * 2, gdn_prefill_conv_states_[i][j]);
-                gdn_req.set_output_tensor(2 + j * 2, gdn_prefill_rec_states_[i][j]);
-            }
-        }
-
         auto& attn_req = attn_requests_[i];
         attn_req.set_input_tensor(0, s1_hidden_);
         attn_req.set_input_tensor(1, s1_pos_);
@@ -709,6 +559,9 @@ void Qwen35HybridModel::bind_decode_tensors() {
         attn_req.set_input_tensor(5, s1_attn_mask_);
     }
     head_request_.set_input_tensor(0, s1_hidden_);
+
+    // Initialize mask for incremental decode updates
+    init_decode_attn_mask();
 }
 
 // ---------------------------------------------------------------------------
@@ -716,27 +569,15 @@ void Qwen35HybridModel::bind_decode_tensors() {
 // ---------------------------------------------------------------------------
 
 void Qwen35HybridModel::reset() {
-    if (has_gdn_s1_) {
-        // S1 explicit I/O: zero shared state buffers (used by both decode and prefill)
+    init_gdn_states();
+    if (has_gdn_prefill_) {
+        // Prefill blocks have separate state buffers — zero them
         for (int blk = 0; blk < cfg_.num_blocks; ++blk) {
             for (int j = 0; j < 3; ++j) {
                 std::memset(gdn_prefill_conv_states_[blk][j].data<float>(), 0,
                             gdn_prefill_conv_states_[blk][j].get_byte_size());
                 std::memset(gdn_prefill_rec_states_[blk][j].data<float>(), 0,
                             gdn_prefill_rec_states_[blk][j].get_byte_size());
-            }
-        }
-    } else {
-        init_gdn_states();
-        if (has_gdn_prefill_) {
-            // Prefill blocks have separate state buffers — zero them
-            for (int blk = 0; blk < cfg_.num_blocks; ++blk) {
-                for (int j = 0; j < 3; ++j) {
-                    std::memset(gdn_prefill_conv_states_[blk][j].data<float>(), 0,
-                                gdn_prefill_conv_states_[blk][j].get_byte_size());
-                    std::memset(gdn_prefill_rec_states_[blk][j].data<float>(), 0,
-                                gdn_prefill_rec_states_[blk][j].get_byte_size());
-                }
             }
         }
     }
@@ -746,14 +587,4 @@ void Qwen35HybridModel::reset() {
         std::memset(kv_value_tensors_[i].data<float>(), 0, kv_total_ * sizeof(float));
     }
     past_length_ = 0;
-
-    // Reset MTP state
-    if (has_mtp_) {
-        reset_mtp_kv();
-        spec_accepted_ = 0;
-        spec_rejected_ = 0;
-        spec_draft_ms_ = 0;
-        spec_verify_ms_ = 0;
-        spec_rollback_ms_ = 0;
-    }
 }

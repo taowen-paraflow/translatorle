@@ -50,10 +50,14 @@ Qwen3.5 使用 **Gated Delta Networks (GDN) 混合架构**，不是标准 Transf
 | 设备 | 状态 | Prefill | Decode | 备注 |
 |------|------|---------|--------|------|
 | CPU | 正常 | ~1.5 tok/s | ~3.6 tok/s | 稳定 |
-| **GPU_ONLY** | **正常** | **9.1 tok/s** | **22.6 tok/s** | 全 stateful，ScatterUpdate-3 KV cache |
-| **HYBRID (GPU+NPU) Python** | **正常** | **~60 tok/s** | **14.9 tok/s** | GDN→GPU(stateful), Attn→NPU(explicit), layer-major prefill (full-batch GDN + chunked attn S=16/8/4/2) |
-| **HYBRID (GPU+NPU) C++** | **正常** | **~24 tok/s** | **21 tok/s peak / 10-14 sustained** | 同 Python 架构 + chunkwise GDN prefill + 量化(INT4/INT8) + 零分配热循环。Lunar Lake 热节流导致 sustained 降 |
+| **GPU_ONLY** | **正常** | **2.2 tok/s** | **4.9 tok/s** | 全 stateful，ScatterUpdate-3 KV cache（量化模型） |
+| **Single-IR GPU FP16** | **正常** | — | **7.4 tok/s avg** | 不拆图 baseline，单 IR stateful |
+| **Single-IR GPU INT4** | **正常** | — | **8.8 tok/s avg** | 不拆图 INT4 baseline |
+| **HYBRID (GPU+NPU) Python** | **正常** | — | **8.5 tok/s avg** | GDN→GPU(stateful), Attn→NPU(explicit), layer-major prefill |
+| **HYBRID (GPU+NPU) C++** | **正常** | — | **13.3 tok/s avg** | 量化(INT4/INT8) + 零分配热循环。冷态 16.7，热态 7.0（Lunar Lake 热节流） |
 | NPU only | 不可用 | — | — | GDN 递归 FP16 精度不足 |
+
+详细多轮 benchmark 数据见 `benchmark.md`。
 
 ### NPU 单独跑 GDN 不行，但 attention 子图可以
 
@@ -221,23 +225,18 @@ NPU stateful（ReadValue/Assign）在子图模式下有固有开销：
 - ~~**GPU attention decode**~~ ✗ → GPU 资源争抢，2.2x 退化
 - ~~**LATENCY hint**~~ ✗ → Python API 不兼容
 
-#### 瓶颈分析（profiling 实测）
+#### 瓶颈分析（多轮 benchmark 实测，2026-03-14）
 
-**C++ HYBRID decode**（21 tok/s peak，量化 INT4+INT8，GPU 冷态）：
-- GDN blocks x 6：33.3ms（**69%**）— 绝对主导瓶颈，~5.5ms/block
-- Attn blocks x 6：11.1ms（23%）— NPU ~1.8ms/block + KV memcpy
-- Head：3.0ms（6%）
-- Overhead：<0.1ms — 零分配热循环
+**C++ HYBRID decode**（3 轮平均 13.3 tok/s，量化 INT4+INT8）：
+- GDN blocks x 6：63.2ms（**79.6%**）— 绝对主导瓶颈，~10.5ms/block
+- Attn blocks x 6：12.6ms（15.8%）— NPU ~2.1ms/block（非常稳定）
+- Head：3.5ms（4.4%）
+- Overhead：<0.1ms — 零分配热循环、增量 mask、无 timing 开销
+- **Total: 79.3ms/token（--timing 模式）**
 
-**Python HYBRID decode**（7.9 tok/s with profiling，无 profiling ~11-14 tok/s）：
-- GDN blocks x 6：95.2ms（**73.6%**）— 绝对主导瓶颈
-- Attn blocks x 6：24.2ms（18.7%）— NPU ~4ms/block
-- Head：9.7ms（7.5%）
-- Python overhead：0.15ms（**0.1%**）— 几乎为零
+**热节流影响**：同一配置 3 轮测试，decode 从 8.2 到 10.8 tok/s（30% 波动）。30 秒冷却后恢复。连续推理以 ~8-9 tok/s 为准。
 
-**关键结论**：Python overhead 可以忽略不计（0.1%），性能差距完全在 OpenVINO 运行时。GDN blocks 占 73.6%，是唯一值得优化的目标。但 GDN 需要 FP32 + Loop 节点在 GPU 上运行，优化空间已接近极限。
-
-**注意**：Lunar Lake 有严重的热节流问题，GPU 时钟会动态调整。连续多次 GPU 密集运行后性能可能降到正常值的 50%。benchmark 数据必须考虑热状态。
+**关键结论**：GDN 占 82%，是唯一值得优化的目标。GDN 需要 FP32 + Loop 在 GPU 上运行，优化空间接近极限。详细数据见 `benchmark.md`。
 
 ### 量化实验结果
 
@@ -255,18 +254,19 @@ uv run python -m qwen35.scripts.test_quality --model-dir models/qwen35/Qwen3.5-0
 
 **测试结果（6 prompt, HYBRID NPU+GPU, 80 tokens/prompt）**:
 
-| 配置 | 模型大小 | Avg Decode tok/s | 质量偏差 |
-|------|---------|-----------------|---------|
-| FP16 baseline | 5.5 GB | ~13.6 | — |
-| Attn INT4_SYM only | 5.3 GB | ~13.3 | 1/6 divergent（factual_cn，仍正确） |
-| Attn INT4 + Head INT4 | 4.8 GB | ~13.8 | 1/6 divergent（factual_cn，仍正确） |
-| **Attn INT4 + GDN INT8 + Head INT4** | **4.1 GB** | **~14.5** | 2/6 divergent（语义正确） |
+| 配置 | 模型大小 | C++ Decode avg | Python Decode avg | 质量偏差 |
+|------|---------|---------------|------------------|---------|
+| FP16 baseline | 5.5 GB | — | ~7.5 tok/s | — |
+| **Attn INT4 + GDN INT8 + Head INT4** | **3.4 GB** | **13.3 tok/s** | **8.5 tok/s** | 2/6 divergent（语义正确） |
+| Single-IR GPU INT4 | ~0.5 GB | — | 8.8 tok/s | 不拆图 baseline |
+
+*以上为 3 轮平均，23 tok prompt → 80 tok decode。详细数据见 `benchmark.md`。*
 
 **关键发现**:
 - **GDN INT8_SYM 安全** — 递归精度未受影响，reasoning prompt（数学题）输出与 baseline 完全一致
 - **Attn INT4_SYM 安全** — 标准 Transformer 对 INT4 鲁棒性好，NPU 上 INT4_SYM 是最优精度
 - **Head INT4_SYM** — NNCF 对 248k vocab 投影做 INT4，减少 ~700MB
-- **全量化比 FP16 更快** — GPU 带宽减半，decode 从 ~13.6 提升到 ~14.5 tok/s
+- **量化 HYBRID > FP16 HYBRID > GPU_ONLY** — NPU 分担 Attn + 权重压缩减少 GPU 带宽占用
 - **divergent ≠ 错误** — 偏差仅在措辞上（如"北京"回答方式不同），语义完全正确
 - **推荐配方**: `--attn-mode int4_sym --gdn-mode int8_sym --head-mode int4_sym`
 
@@ -277,7 +277,8 @@ uv run python -m qwen35.scripts.test_quality --model-dir models/qwen35/Qwen3.5-0
 | `export_hybrid.py` | 导出 19 子图 IR（GDN decode/prefill + Attention + Head blocks） |
 | `chunkwise_gdn.py` | `ChunkwiseRecurrentAttentionCell` — WY representation 并行 GDN prefill（无 Loop，纯 MatMul） |
 | `inference_hybrid.py` | `Qwen35HybridModel` — 编排 19 子图推理，chunkwise GDN prefill + Loop GDN decode + chunked Attn |
-| `cpp/` | C++ hybrid 推理（同架构，16-18 tok/s decode），见下方 |
+| `cpp/` | C++ hybrid 推理（同架构，~9 tok/s avg decode），见下方 |
+| `benchmark.md` | 多轮 benchmark 结果、时间分解、热节流分析 |
 | `scripts/run_inference.py` | 统一入口，`--device HYBRID/GPU_ONLY/CPU_ONLY` |
 | `scripts/quantize_hybrid.py` | Per-subgraph NNCF 权重量化（Attn INT4 / GDN INT8 / Head INT4） |
 | `scripts/test_quality.py` | 6 prompt 质量对比测试，支持 baseline side-by-side |
@@ -294,12 +295,12 @@ C++ 实现与 Python 使用相同的 19 子图架构（6 GDN decode + 6 GDN pref
 - NPU `set_output_tensor` 会 2x 减速（KV aliased buffer 触发内部拷贝），保留 memcpy
 - NPU hidden 输出 shape 与输入不同（S=1 时 [B,H] 而非 [B,1,H]），必须 memcpy
 
-**性能（量化模型 INT4+INT8，4.1GB）：**
-- **Decode peak**: ~21 tok/s（GPU 冷态）
-- **Decode sustained**: 10-14 tok/s（GPU 热态，受 Lunar Lake 热节流影响）
-- **Prefill**: ~24 tok/s（chunkwise parallel GDN）
+**性能（量化模型 INT4+INT8，3.4GB，3 轮平均，2026-03-14）：**
+- **Decode**: 13.3 tok/s avg（冷态 16.7，热态 7.0）
+- **Prefill**: 5 token prompt, ~900ms 冷态
+- **时间分解**: GDN 63.2ms (80%) + Attn 12.6ms (16%) + Head 3.5ms (4%) = 79.3ms/tok
 
-**注意**：Lunar Lake iGPU 热节流严重。GPU 时钟可从 peak 降到 1/3。连续 GPU 密集操作（编译、推理）后性能可降 50-70%。benchmark 必须考虑热状态。后台进程（VS Code、音乐播放器等）共享热包络，会加剧节流。
+**注意**：Lunar Lake iGPU 热节流导致 2.4x 性能波动（冷态 16.7 vs 热态 7.0 tok/s）。30 秒冷却可恢复。连续推理以 sustained 为准。
 
 **构建与运行：**
 ```powershell
@@ -332,8 +333,8 @@ Embedding 查表在 Python 侧完成（从 `embed_tokens.npy` 查），text-only
 | `inference.py` | `Qwen35OVModel` — 继承 `GenerationMixin`，管理 stateful 推理（单 IR） |
 | `export.py` | PyTorch → OpenVINO 单 IR 导出（model patching + stateful 转换） |
 | `stateful.py` | IR 后处理：cache 输入/输出 → ReadValue/Assign 变量 |
-| `export_hybrid.py` | 导出 13 子图 IR（GDN/Attention/Head blocks），显式 I/O |
-| `inference_hybrid.py` | `Qwen35HybridModel` — 编排 13 子图混合推理 |
+| `export_hybrid.py` | 导出 19 子图 IR（GDN decode/prefill + Attention + Head blocks），显式 I/O |
+| `inference_hybrid.py` | `Qwen35HybridModel` — 编排 19 子图混合推理 |
 
 ## VL（视觉语言）模块
 
@@ -417,3 +418,16 @@ models/qwen35/
     ├── tokenizer.json
     └── tokenizer_config.json
 ```
+
+## 归档文档
+
+以下规划/研究文档已完成使命，移至 `docs/archived/`：
+
+| 文档 | 内容 | 归档原因 |
+|------|------|---------|
+| `mtp.md` | MTP speculative decoding 实现计划 | 已实现，经验记录在 `memory/mtp-speculative-decoding.md` |
+| `new-optimization.md` | MTP + Loop-free S=1 优化方向 | MTP 无效，Loop-free 反慢 21% |
+| `perf-analysis.md` | 早期 HYBRID vs GPU_ONLY 分析 | 数据已过时（HYBRID 现已优于 GPU_ONLY） |
+| `chunkwise-parallel-gdn.md` | WY representation 并行 GDN 方案 | 已实现并集成到代码中 |
+| `hybrid-gpu-npu-plan.md` | GPU+NPU 混合推理原始规划 | 所有 phase 已完成 |
+| `attn-export-issue.md` | Attention 子图导出 bug report | 已修复 |

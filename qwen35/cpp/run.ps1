@@ -10,7 +10,8 @@ param(
     [string]$Prompt = "The capital of France is",
     [int]$MaxTokens = 50,
     [int]$ChunkSize = 16,
-    [int]$AttnPastSeq = 256
+    [int]$AttnPastSeq = 256,
+    [switch]$Timing
 )
 
 $root = "C:\Apps\translatorle"
@@ -27,10 +28,14 @@ if (-not (Test-Path $exe)) {
     exit 1
 }
 
-& $exe `
-    --model-dir $modelDir `
-    --prompt $Prompt `
-    --max-tokens $MaxTokens `
-    --prefill-chunk-size $ChunkSize `
-    --attn-past-seq $AttnPastSeq `
-    --tokenizers-lib $tokLib
+$args_ = @(
+    "--model-dir", $modelDir,
+    "--prompt", $Prompt,
+    "--max-tokens", $MaxTokens,
+    "--prefill-chunk-size", $ChunkSize,
+    "--attn-past-seq", $AttnPastSeq,
+    "--tokenizers-lib", $tokLib
+)
+if ($Timing) { $args_ += "--timing" }
+
+& $exe @args_

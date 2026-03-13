@@ -2,13 +2,22 @@
 //
 // Hot-loop optimization: all ov::Tensor objects are pre-allocated in alloc_buffers().
 // No heap allocations occur during decode or prefill forward passes.
+// Decode attention mask is incremental (1 float write/step vs 1KB memset).
+// Timing instrumentation is off by default (--timing flag to enable).
 #include "hybrid_model.h"
 #include "tokenizer.h"
 #include "utils.h"
 
 #include <algorithm>
 #include <cstring>
-#include <set>
+
+// ---------------------------------------------------------------------------
+// Stop token check (inline, no std::set overhead)
+// ---------------------------------------------------------------------------
+
+static inline bool is_stop_token(int id) {
+    return id == 151645 || id == 151643 || id == 248044;
+}
 
 // ---------------------------------------------------------------------------
 // GDN block inference (GPU, stateful)
@@ -16,15 +25,6 @@
 
 void Qwen35HybridModel::run_gdn_block(int block_idx, int seq_len) {
     auto& req = gdn_requests_[block_idx];
-
-    if (has_gdn_s1_) {
-        // S1 explicit I/O: all tensors pre-bound in bind_decode_tensors().
-        // State I/O uses same host buffers — GPU copies in/out automatically.
-        req.infer();
-        return;
-    }
-
-    // Stateful path (Loop-based blocks)
     bool is_decode = (seq_len == 1);
     auto& hidden = is_decode ? s1_hidden_ : sc_hidden_.at(seq_len);
     req.set_input_tensor(0, hidden);
@@ -123,6 +123,7 @@ void Qwen35HybridModel::run_attn_block(int block_idx, int seq_len, bool use_pref
 
 // ---------------------------------------------------------------------------
 // Attention mask (causal, fixed-size KV cache)
+// Used by prefill and multi-token paths. Decode uses incremental mask instead.
 // ---------------------------------------------------------------------------
 
 void Qwen35HybridModel::fill_attn_mask(int seq_len) {
@@ -162,40 +163,64 @@ const float* Qwen35HybridModel::forward(
 
     if (is_decode) {
         // --- Decode fast path: tensors pre-bound in bind_decode_tensors() ---
-        // Only need to update position_ids, cache_position, and attn_mask content.
+        // Only need to update position_ids, cache_position, and attn_mask.
         // Hidden content updated by embedding lookup above (same buffer).
         for (int c = 0; c < 3; ++c) pos_buf_[c] = past_length_;
         cache_pos_buf_[0] = past_length_;
-        fill_attn_mask(1);
+        // Incremental mask: init_decode_attn_mask() set the base,
+        // now just unmask the current position (1 float write vs 1KB memset)
+        attn_mask_buf_[past_length_] = 0.0f;
 
-        for (int i = 0; i < cfg_.num_blocks; ++i) {
+        if (timing_) {
+            // Timed decode path: 12 chrono::now() calls per token
+            for (int i = 0; i < cfg_.num_blocks; ++i) {
+                auto t0 = std::chrono::steady_clock::now();
+                gdn_requests_[i].infer();
+                decode_gdn_ms_[i] += elapsed_ms(t0);
+
+                t0 = std::chrono::steady_clock::now();
+                attn_requests_[i].infer();
+                std::memcpy(hidden_buf_.data(),
+                            attn_requests_[i].get_output_tensor(0).data<const float>(),
+                            H * sizeof(float));
+                std::memcpy(kv_key_tensors_[i].data<float>(),
+                            attn_requests_[i].get_output_tensor(1).data<const float>(),
+                            kv_total_ * sizeof(float));
+                std::memcpy(kv_value_tensors_[i].data<float>(),
+                            attn_requests_[i].get_output_tensor(2).data<const float>(),
+                            kv_total_ * sizeof(float));
+                decode_attn_ms_[i] += elapsed_ms(t0);
+            }
+
+            past_length_ += 1;
+            if (!run_head) return nullptr;
+
             auto t0 = std::chrono::steady_clock::now();
-            gdn_requests_[i].infer();
-            decode_gdn_ms_[i] += elapsed_ms(t0);
+            head_request_.infer();
+            decode_head_ms_ += elapsed_ms(t0);
+            decode_steps_++;
+        } else {
+            // Fast decode path: no timing overhead
+            for (int i = 0; i < cfg_.num_blocks; ++i) {
+                gdn_requests_[i].infer();
+                attn_requests_[i].infer();
+                std::memcpy(hidden_buf_.data(),
+                            attn_requests_[i].get_output_tensor(0).data<const float>(),
+                            H * sizeof(float));
+                std::memcpy(kv_key_tensors_[i].data<float>(),
+                            attn_requests_[i].get_output_tensor(1).data<const float>(),
+                            kv_total_ * sizeof(float));
+                std::memcpy(kv_value_tensors_[i].data<float>(),
+                            attn_requests_[i].get_output_tensor(2).data<const float>(),
+                            kv_total_ * sizeof(float));
+            }
 
-            t0 = std::chrono::steady_clock::now();
-            attn_requests_[i].infer();
-            // Copy outputs — NPU may squeeze S=1 dim; KV aliased I/O causes 2x slowdown
-            std::memcpy(hidden_buf_.data(),
-                        attn_requests_[i].get_output_tensor(0).data<const float>(),
-                        H * sizeof(float));
-            std::memcpy(kv_key_tensors_[i].data<float>(),
-                        attn_requests_[i].get_output_tensor(1).data<const float>(),
-                        kv_total_ * sizeof(float));
-            std::memcpy(kv_value_tensors_[i].data<float>(),
-                        attn_requests_[i].get_output_tensor(2).data<const float>(),
-                        kv_total_ * sizeof(float));
-            decode_attn_ms_[i] += elapsed_ms(t0);
+            past_length_ += 1;
+            if (!run_head) return nullptr;
+
+            head_request_.infer();
+            decode_steps_++;
         }
-
-        past_length_ += 1;
-
-        if (!run_head) return nullptr;
-
-        auto t0 = std::chrono::steady_clock::now();
-        head_request_.infer();
-        decode_head_ms_ += elapsed_ms(t0);
-        decode_steps_++;
 
         return head_request_.get_output_tensor(0).data<const float>();
     }
@@ -245,31 +270,28 @@ const float* Qwen35HybridModel::prefill(const int64_t* token_ids, int prompt_len
         pos += cs;
     }
 
-    // Allocate full-prompt buffer (once per generation, negligible overhead)
-    std::vector<float> full_hidden(prompt_len * H);
+    // Use pre-allocated prefill buffer (no heap alloc)
+    float* full_hidden = prefill_hidden_buf_.data();
+    int64_t* full_gdn_mask = prefill_gdn_mask_.data();
 
     // Embedding lookup
     for (int i = 0; i < prompt_len; ++i) {
-        std::memcpy(full_hidden.data() + i * H,
+        std::memcpy(full_hidden + i * H,
                     embed_table_.data() + token_ids[i] * H,
                     H * sizeof(float));
     }
 
-    // GDN mask: all ones, sized for full prompt
-    std::vector<int64_t> full_gdn_mask(prompt_len, 1LL);
-
-    // Create tensor wrappers for full-prompt GDN
+    // Create tensor wrappers for full-prompt GDN (wraps pre-allocated buffer)
     ov::Tensor full_hidden_tensor(ov::element::f32,
         {1, static_cast<size_t>(prompt_len), static_cast<size_t>(H)},
-        full_hidden.data());
+        full_hidden);
     ov::Tensor full_mask_tensor(ov::element::i64,
         {1, static_cast<size_t>(prompt_len)},
-        full_gdn_mask.data());
+        full_gdn_mask);
 
-    // --- Timing arrays ---
+    // --- Timing arrays (always needed for prefill report) ---
     std::vector<double> gdn_times(cfg_.num_blocks, 0.0);
     std::vector<double> attn_times(cfg_.num_blocks, 0.0);
-    // Per-layer per-chunk timing: attn_chunk_times[layer][chunk_idx]
     std::vector<std::vector<double>> attn_chunk_times(
         cfg_.num_blocks, std::vector<double>(chunks.size(), 0.0));
 
@@ -277,10 +299,8 @@ const float* Qwen35HybridModel::prefill(const int64_t* token_ids, int prompt_len
         // --- GDN block (GPU): full prompt at once ---
         auto gdn_t0 = std::chrono::steady_clock::now();
         if (has_gdn_prefill_) {
-            // Chunkwise parallel GDN (no Loop, MatMul-based)
             run_gdn_prefill_block(layer, full_hidden_tensor, full_mask_tensor);
         } else {
-            // Fallback: Loop-based stateful GDN (sequential)
             auto& gdn_req = gdn_requests_[layer];
             gdn_req.set_input_tensor(0, full_hidden_tensor);
             gdn_req.set_input_tensor(1, full_mask_tensor);
@@ -296,19 +316,16 @@ const float* Qwen35HybridModel::prefill(const int64_t* token_ids, int prompt_len
             int cs = chunk.len;
             past_length_ = chunk.start;
 
-            // Copy chunk hidden from full buffer to hidden_buf_
             std::memcpy(hidden_buf_.data(),
-                        full_hidden.data() + chunk.start * H,
+                        full_hidden + chunk.start * H,
                         cs * H * sizeof(float));
 
             auto attn_chunk_t0 = std::chrono::steady_clock::now();
-            // Run attention via existing method (uses hidden_buf_)
             bool use_prefill = attn_prefill_requests_.count(cs) > 0;
             run_attn_block(layer, cs, use_prefill);
             attn_chunk_times[layer][ci] = elapsed_ms(attn_chunk_t0);
 
-            // Copy result back to full buffer
-            std::memcpy(full_hidden.data() + chunk.start * H,
+            std::memcpy(full_hidden + chunk.start * H,
                         hidden_buf_.data(),
                         cs * H * sizeof(float));
         }
@@ -323,12 +340,12 @@ const float* Qwen35HybridModel::prefill(const int64_t* token_ids, int prompt_len
         transfer_prefill_states_to_decode();
     }
 
-    // Restore decode tensor bindings (prefill may rebind GDN requests to full_hidden_tensor)
+    // Restore decode tensor bindings + initialize incremental decode mask
     bind_decode_tensors();
 
     // Head: last token only
     std::memcpy(hidden_buf_.data(),
-                full_hidden.data() + (prompt_len - 1) * H,
+                full_hidden + (prompt_len - 1) * H,
                 H * sizeof(float));
     head_request_.set_input_tensor(0, s1_hidden_);
     auto head_t0 = std::chrono::steady_clock::now();
@@ -342,36 +359,29 @@ const float* Qwen35HybridModel::prefill(const int64_t* token_ids, int prompt_len
     std::string gdn_line = "  GDN : ";
     for (int i = 0; i < cfg_.num_blocks; ++i) {
         gdn_total += gdn_times[i];
-        gdn_line += "[" + std::to_string(i) + "]=" +
-                    std::to_string(gdn_times[i]).substr(0, std::to_string(gdn_times[i]).find('.') + 2) +
-                    "ms ";
+        gdn_line += "[" + std::to_string(i) + "]=" + fmt_ms(gdn_times[i]) + "ms ";
     }
-    gdn_line += " total=" + std::to_string(gdn_total).substr(0, std::to_string(gdn_total).find('.') + 2) + "ms";
+    gdn_line += " total=" + fmt_ms(gdn_total) + "ms";
 
     std::string attn_line = "  Attn: ";
     for (int i = 0; i < cfg_.num_blocks; ++i) {
         attn_total += attn_times[i];
-        attn_line += "[" + std::to_string(i) + "]=" +
-                     std::to_string(attn_times[i]).substr(0, std::to_string(attn_times[i]).find('.') + 2) +
-                     "ms ";
+        attn_line += "[" + std::to_string(i) + "]=" + fmt_ms(attn_times[i]) + "ms ";
     }
-    attn_line += " total=" + std::to_string(attn_total).substr(0, std::to_string(attn_total).find('.') + 2) + "ms";
+    attn_line += " total=" + fmt_ms(attn_total) + "ms";
 
-    // Chunk breakdown: show per-chunk sizes and per-layer timing
     std::string chunk_hdr = "  Chunks: ";
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
         chunk_hdr += "S=" + std::to_string(chunks[ci].len);
         if (ci + 1 < chunks.size()) chunk_hdr += ",";
     }
 
-    // Per-layer per-chunk detail
     std::string chunk_detail;
     for (int layer = 0; layer < cfg_.num_blocks; ++layer) {
         chunk_detail += "  Attn[" + std::to_string(layer) + "] chunks: ";
         for (size_t ci = 0; ci < chunks.size(); ++ci) {
-            std::string val = std::to_string(attn_chunk_times[layer][ci]);
-            val = val.substr(0, val.find('.') + 2);
-            chunk_detail += "S" + std::to_string(chunks[ci].len) + "=" + val + "ms ";
+            chunk_detail += "S" + std::to_string(chunks[ci].len) + "=" +
+                            fmt_ms(attn_chunk_times[layer][ci]) + "ms ";
         }
         chunk_detail += "\n";
     }
@@ -381,11 +391,11 @@ const float* Qwen35HybridModel::prefill(const int64_t* token_ids, int prompt_len
     log(attn_line);
     log(chunk_hdr);
     log(chunk_detail);
-    log("  Head: " + std::to_string(head_ms).substr(0, std::to_string(head_ms).find('.') + 2) + "ms");
-    log("  Total prefill: " + std::to_string(total_ms).substr(0, std::to_string(total_ms).find('.') + 2) + "ms");
-    log("  Breakdown: GDN " + std::to_string(gdn_total / total_ms * 100).substr(0, 4) + "% + Attn " +
-        std::to_string(attn_total / total_ms * 100).substr(0, 4) + "% + Head " +
-        std::to_string(head_ms / total_ms * 100).substr(0, 4) + "%");
+    log("  Head: " + fmt_ms(head_ms) + "ms");
+    log("  Total prefill: " + fmt_ms(total_ms) + "ms");
+    log("  Breakdown: GDN " + fmt_pct(gdn_total / total_ms * 100) + "% + Attn " +
+        fmt_pct(attn_total / total_ms * 100) + "% + Head " +
+        fmt_pct(head_ms / total_ms * 100) + "%");
 
     return head_request_.get_output_tensor(0).data<const float>();
 }
@@ -420,164 +430,28 @@ std::string Qwen35HybridModel::generate(const std::string& prompt, int max_new_t
 
     double prefill_ms = elapsed_ms(t0);
     log("Prefill: " + std::to_string(prompt_len) + " tokens in " +
-        std::to_string(prefill_ms) + " ms (" +
-        std::to_string(prompt_len / (prefill_ms / 1000.0)) + " tok/s, chunk=" +
+        fmt_ms(prefill_ms) + " ms (" +
+        fmt_ms(prompt_len / (prefill_ms / 1000.0)) + " tok/s, chunk=" +
         std::to_string(chunk_size) + ", layer-major)");
 
-    // --- Greedy decode (with optional MTP speculative decoding) ---
+    // --- Greedy decode ---
     int V = cfg_.vocab_size;
-    int H = cfg_.hidden_size;
     int next_id = static_cast<int>(
         std::max_element(logits, logits + V) - logits);
 
     std::vector<int64_t> generated;
     generated.push_back(next_id);
 
-    std::set<int> stop_ids = {151645, 151643, 248044};
-
-    // MTP speculative decode state
-    const int MAX_DRAFT = 8;  // max draft tokens per round
-    int eff_mtp_steps = has_mtp_ ? std::min(mtp_steps_, MAX_DRAFT) : 0;
-
     auto t_decode = std::chrono::steady_clock::now();
 
-    for (int step = 0; step < max_new_tokens - 1; ) {
-        if (stop_ids.count(next_id)) break;
+    for (int step = 0; step < max_new_tokens - 1; ++step) {
+        if (is_stop_token(next_id)) break;
 
-        if (eff_mtp_steps <= 0) {
-            // --- Normal decode (no MTP) ---
-            int64_t tid = static_cast<int64_t>(next_id);
-            logits = forward(&tid, 1, /*run_head=*/true);
-            next_id = static_cast<int>(
-                std::max_element(logits, logits + V) - logits);
-            generated.push_back(next_id);
-            step++;
-            continue;
-        }
-
-        // === MTP Speculative Decode ===
-        //
-        // Flow for each round:
-        //   1. Main model decode: process next_id -> logits -> main_next
-        //      (hidden_buf_ now has the hidden state, GDN/KV states updated)
-        //   2. MTP draft: use hidden_buf_ to predict draft tokens D[0..N-1]
-        //   3. Verify: check if main_next == D[0].
-        //      If yes, feed D[0] into main model -> check D[1], etc.
-        //      If no, reject all drafts.
-        //   4. Output: main_next + all accepted drafts + bonus token
-        //
-        // Key insight: the main model decode in step 1 gives us main_next
-        // "for free" — we can compare it with D[0] without extra compute.
-
-        // Step 1: Main model decode
-        {
-            int64_t tid = static_cast<int64_t>(next_id);
-            logits = forward(&tid, 1, /*run_head=*/true);
-        }
-        int main_next = static_cast<int>(
+        int64_t tid = static_cast<int64_t>(next_id);
+        logits = forward(&tid, 1, /*run_head=*/true);
+        next_id = static_cast<int>(
             std::max_element(logits, logits + V) - logits);
-
-        // Step 2: MTP draft
-        // Note: MTP KV cache accumulates across decode steps (NOT reset per round).
-        // For mtp_steps=1, each MTP call uses the main model's actual prediction,
-        // so the accumulated context is always based on correct tokens. This matches
-        // the Python reference implementation and gives ~56% acceptance (vs ~4% if
-        // reset every round).
-        auto t_draft = std::chrono::steady_clock::now();
-        std::memcpy(mtp_saved_hidden_.data(), hidden_buf_.data(), H * sizeof(float));
-        std::memcpy(mtp_hidden_buf_.data(), mtp_saved_hidden_.data(), H * sizeof(float));
-
-        int64_t draft_tokens[MAX_DRAFT];
-        int draft_len = 0;
-
-        for (int d = 0; d < eff_mtp_steps; d++) {
-            int input_token = (d == 0) ? main_next
-                                       : static_cast<int>(draft_tokens[d - 1]);
-            int draft_id = run_mtp_draft(input_token);
-            draft_tokens[d] = static_cast<int64_t>(draft_id);
-            draft_len++;
-            if (stop_ids.count(draft_id)) break;
-        }
-        spec_draft_ms_ += elapsed_ms(t_draft);
-
-        // Step 3: Verify draft tokens against main model
-        //
-        // Two paths:
-        //   A) Batch verify (requires GDN prefill blocks): process all verify
-        //      tokens in one pass through GDN prefill + chunked attention.
-        //      Much cheaper than sequential S=1 forwards (~30ms vs ~95ms for S=2).
-        //   B) Sequential verify (fallback): feed tokens one-by-one.
-        //      No speedup over normal decode, but correct.
-        auto t_verify = std::chrono::steady_clock::now();
-
-        int accepted = 0;
-
-        // Build verify sequence: [main_next, D[0], ..., D[draft_len-1]]
-        int64_t verify_tokens[MAX_DRAFT + 1];
-        verify_tokens[0] = static_cast<int64_t>(main_next);
-        for (int d = 0; d < draft_len; d++)
-            verify_tokens[d + 1] = draft_tokens[d];
-        int verify_len = 1 + draft_len;
-
-        // Batch verify: process all verify tokens in one pass through GDN prefill
-        // + chunked NPU attention. Requires S1 explicit I/O GDN decode blocks
-        // (has_gdn_s1_) so states are in host memory and shared with prefill.
-        if (has_gdn_s1_ && has_gdn_prefill_) {
-            // --- Batch verify (disabled) ---
-            auto [acc, bonus_logits] = batch_verify_draft(
-                verify_tokens, verify_len, draft_tokens, draft_len);
-            accepted = acc;
-            logits = bonus_logits;
-        } else {
-            // --- Sequential verify (fallback) ---
-            {
-                int64_t tid = static_cast<int64_t>(main_next);
-                logits = forward(&tid, 1, /*run_head=*/true);
-            }
-            for (int d = 0; d < draft_len; d++) {
-                int verify_pred = static_cast<int>(
-                    std::max_element(logits, logits + V) - logits);
-                if (verify_pred == static_cast<int>(draft_tokens[d])) {
-                    accepted++;
-                    int64_t tid = draft_tokens[d];
-                    logits = forward(&tid, 1, /*run_head=*/true);
-                } else {
-                    break;
-                }
-            }
-        }
-        spec_verify_ms_ += elapsed_ms(t_verify);
-
-        // Step 4: Output tokens
-        // main_next is always output (main model confirmed it)
-        generated.push_back(main_next);
-        step++;
-        bool hit_stop = stop_ids.count(main_next) > 0;
-
-        // Output accepted draft tokens
-        if (!hit_stop) {
-            for (int d = 0; d < accepted; d++) {
-                generated.push_back(draft_tokens[d]);
-                step++;
-                if (stop_ids.count(static_cast<int>(draft_tokens[d]))) {
-                    hit_stop = true;
-                    break;
-                }
-            }
-        }
-
-        // Bonus token: main model's next prediction after last verified token
-        if (!hit_stop) {
-            next_id = static_cast<int>(
-                std::max_element(logits, logits + V) - logits);
-            generated.push_back(next_id);
-            step++;
-        } else {
-            next_id = static_cast<int>(generated.back());
-        }
-
-        spec_accepted_ += accepted;
-        spec_rejected_ += (draft_len - accepted);
+        generated.push_back(next_id);
     }
 
     double decode_ms = elapsed_ms(t_decode);
@@ -585,56 +459,35 @@ std::string Qwen35HybridModel::generate(const std::string& prompt, int max_new_t
 
     if (decode_ms > 0) {
         log("Decode: " + std::to_string(num_decoded) + " tokens in " +
-            std::to_string(decode_ms) + " ms (" +
-            std::to_string(num_decoded / (decode_ms / 1000.0)) + " tok/s)");
+            fmt_ms(decode_ms) + " ms (" +
+            fmt_ms(num_decoded / (decode_ms / 1000.0)) + " tok/s)");
 
-        // Print decode timing breakdown
-        double gdn_total = 0, attn_total = 0;
-        for (int i = 0; i < cfg_.num_blocks; ++i) {
-            gdn_total += decode_gdn_ms_[i];
-            attn_total += decode_attn_ms_[i];
-        }
-        if (decode_steps_ > 0) {
+        if (timing_ && decode_steps_ > 0) {
+            double gdn_total = 0, attn_total = 0;
+            for (int i = 0; i < cfg_.num_blocks; ++i) {
+                gdn_total += decode_gdn_ms_[i];
+                attn_total += decode_attn_ms_[i];
+            }
             double per_tok = decode_ms / decode_steps_;
-            log("=== Decode Timing Breakdown (avg per token: " +
-                std::to_string(per_tok).substr(0, std::to_string(per_tok).find('.') + 2) + "ms) ===");
+            log("=== Decode Timing Breakdown (avg per token: " + fmt_ms(per_tok) + "ms) ===");
             for (int i = 0; i < cfg_.num_blocks; ++i) {
                 double gdn_avg = decode_gdn_ms_[i] / decode_steps_;
                 double attn_avg = decode_attn_ms_[i] / decode_steps_;
-                log("  Block " + std::to_string(i) + ": GDN=" +
-                    std::to_string(gdn_avg).substr(0, std::to_string(gdn_avg).find('.') + 2) +
-                    "ms  Attn=" +
-                    std::to_string(attn_avg).substr(0, std::to_string(attn_avg).find('.') + 2) + "ms");
+                log("  Block " + std::to_string(i) + ": GDN=" + fmt_ms(gdn_avg) +
+                    "ms  Attn=" + fmt_ms(attn_avg) + "ms");
             }
             double gdn_avg = gdn_total / decode_steps_;
             double attn_avg = attn_total / decode_steps_;
             double head_avg = decode_head_ms_ / decode_steps_;
-            log("  Total: GDN=" +
-                std::to_string(gdn_avg).substr(0, std::to_string(gdn_avg).find('.') + 2) +
-                "ms (" + std::to_string(gdn_total / decode_ms * 100).substr(0, 4) +
-                "%)  Attn=" +
-                std::to_string(attn_avg).substr(0, std::to_string(attn_avg).find('.') + 2) +
-                "ms (" + std::to_string(attn_total / decode_ms * 100).substr(0, 4) +
-                "%)  Head=" +
-                std::to_string(head_avg).substr(0, std::to_string(head_avg).find('.') + 2) +
-                "ms (" + std::to_string(decode_head_ms_ / decode_ms * 100).substr(0, 4) + "%)");
-        }
-
-        // MTP speculative decode statistics
-        if (has_mtp_ && eff_mtp_steps > 0) {
-            int total_drafted = spec_accepted_ + spec_rejected_;
-            double accept_rate = total_drafted > 0
-                ? (100.0 * spec_accepted_ / total_drafted) : 0.0;
-            log("=== MTP Speculative Decode Stats ===");
-            log("  Accepted: " + std::to_string(spec_accepted_) +
-                "  Rejected: " + std::to_string(spec_rejected_) +
-                "  Rate: " + std::to_string(accept_rate).substr(0, 5) + "%");
-            log("  Draft time: " + std::to_string(spec_draft_ms_).substr(0, std::to_string(spec_draft_ms_).find('.') + 2) +
-                "ms  Verify time: " + std::to_string(spec_verify_ms_).substr(0, std::to_string(spec_verify_ms_).find('.') + 2) + "ms");
+            log("  Total: GDN=" + fmt_ms(gdn_avg) + "ms (" +
+                fmt_pct(gdn_total / decode_ms * 100) + "%)  Attn=" +
+                fmt_ms(attn_avg) + "ms (" + fmt_pct(attn_total / decode_ms * 100) +
+                "%)  Head=" + fmt_ms(head_avg) + "ms (" +
+                fmt_pct(decode_head_ms_ / decode_ms * 100) + "%)");
         }
     }
 
-    if (!generated.empty() && stop_ids.count(static_cast<int>(generated.back()))) {
+    if (!generated.empty() && is_stop_token(static_cast<int>(generated.back()))) {
         generated.pop_back();
     }
 
