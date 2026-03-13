@@ -79,11 +79,12 @@ class OVCodePredictor:
         self._n_groups = min(max(n_groups, 1), 15)
         core = ov.Core()
         model = core.read_model(cp_xml)
-        config = {"PERFORMANCE_HINT": "LATENCY"}
         if device == "GPU":
             # Talker hidden states can have large values (up to ~90) that overflow
             # in FP16 attention computation. Force FP32 to avoid NaN.
-            config["INFERENCE_PRECISION_HINT"] = "f32"
+            config = {"INFERENCE_PRECISION_HINT": "f32"}
+        else:
+            config = {"PERFORMANCE_HINT": "LATENCY"}
         self._compiled = core.compile_model(model, device, config)
         self._request = self._compiled.create_infer_request()
 
