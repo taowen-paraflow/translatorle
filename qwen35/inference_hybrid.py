@@ -1,9 +1,14 @@
 """Hybrid GPU+NPU inference for Qwen3.5.
 
-Orchestrates 13 subgraph IRs exported by export_hybrid.py:
-  - 6 GDN blocks on GPU (contain Loop nodes, need FP32)
-  - 6 Attention blocks on NPU or GPU (standard SDPA, FP16 ok)
+Orchestrates 19 subgraph IRs exported by export_hybrid.py:
+  - 6 GDN decode blocks on GPU (contain Loop nodes, need FP32)
+  - 6 GDN prefill blocks on GPU (chunkwise parallel, no Loop)
+  - 6 Attention blocks on NPU (decode) + GPU (prefill)
   - 1 Head block on GPU
+
+GPU attention prefill: during prefill, attention runs on GPU (one call
+per layer, full prompt, dynamic shapes) for speed. During decode,
+attention switches to NPU (S=1 static shape).
 
 Run (root venv):
   powershell.exe -Command 'cd C:\\Apps\\translatorle; uv run python -m qwen35.inference_hybrid --prompt "Hello" --device HYBRID'
@@ -28,7 +33,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class Qwen35HybridModel:
-    """Hybrid GPU+NPU inference for Qwen3.5 using 13 subgraph IRs."""
+    """Hybrid GPU+NPU inference for Qwen3.5 using 19 subgraph IRs."""
 
     def __init__(
         self,
@@ -39,17 +44,26 @@ class Qwen35HybridModel:
         attn_past_seq: int = 256,
         attn_stateful: bool = True,
         prefill_chunk_size: int = 16,
+        gdn_prefill_device: str | None = None,
+        attn_gpu_prefill: bool = False,
     ):
         """Load and compile all subgraphs.
 
         Args:
             model_dir: Directory containing the hybrid IR files.
-            gdn_device: Device for GDN blocks (default: GPU).
+            gdn_device: Device for GDN decode blocks (default: GPU).
             attn_device: Device for attention blocks (default: NPU).
             head_device: Device for the head block (default: GPU).
-            embed_device: Device for the embedding block (default: GPU).
             attn_past_seq: Static past_seq length for NPU attention blocks.
                 NPU requires static shapes; KV caches are padded to this size.
+            gdn_prefill_device: Device for GDN prefill blocks (default: same
+                as gdn_device). When "NPU", compiles static-shape models for
+                multiple chunk sizes (max S=16) to limit Neumann series
+                precision loss.
+            attn_gpu_prefill: When True and attn_device="NPU", also compile
+                attention blocks on GPU for prefill (dynamic shapes, one call
+                per layer). Decode still uses NPU. Disable with
+                --no-attn-gpu-prefill for benchmarking.
         """
         model_dir = Path(model_dir)
         core = ov.Core()
@@ -62,6 +76,7 @@ class Qwen35HybridModel:
         self._attn_past_seq = attn_past_seq
         self._gdn_device = gdn_device
         self._attn_device = attn_device
+        self._gdn_prefill_device = gdn_prefill_device or gdn_device
 
         # Load config to get architecture params
         import json
@@ -119,6 +134,62 @@ class Qwen35HybridModel:
         # (dynamic dims default to shape=0 after stateful transform)
         self._init_gdn_states()
 
+        # --- Compile chunkwise GDN prefill blocks (explicit I/O, no Loop) ---
+        gdn_prefill_dev = self._gdn_prefill_device
+        self._gdn_prefill_requests: List = []
+        self._gdn_prefill_npu_requests: dict[int, list] = {}  # seq_len -> [req per block]
+        has_prefill_gdn = (model_dir / "gdn_prefill_block_0.xml").exists()
+        if has_prefill_gdn and gdn_prefill_dev == "NPU":
+            # NPU: compile static shapes for descending powers of 2 (max S=16).
+            # NPU precision degrades above S=16 due to Neumann series error accumulation.
+            gdn_chunk_sizes = []
+            s = min(prefill_chunk_size, 16)
+            while s >= 1:
+                gdn_chunk_sizes.append(s)
+                s //= 2
+            logger.info("Compiling %d chunkwise GDN prefill blocks on NPU for S=%s ...",
+                        num_blocks, gdn_chunk_sizes)
+            t0 = time.time()
+            for cs in gdn_chunk_sizes:
+                requests = []
+                for i in range(num_blocks):
+                    ir = core.read_model(str(model_dir / f"gdn_prefill_block_{i}.xml"))
+                    ir = self._reshape_gdn_prefill_static(ir, cs)
+                    ir = self._add_f32_output_conversion(ir)
+                    if i == 0 and cs == gdn_chunk_sizes[0]:
+                        logger.info("  GDN prefill block inputs (S=%d): %s", cs,
+                                    [(inp.get_any_name(), str(inp.partial_shape),
+                                      str(inp.element_type)) for inp in ir.inputs])
+                    npu_config = {"NPU_COMPILER_TYPE": "PREFER_PLUGIN"}
+                    compiled = core.compile_model(ir, "NPU", npu_config)
+                    requests.append(compiled.create_infer_request())
+                self._gdn_prefill_npu_requests[cs] = requests
+            logger.info("  GDN prefill NPU compilation (%d sizes): %.1fs",
+                        len(gdn_chunk_sizes), time.time() - t0)
+        elif has_prefill_gdn:
+            # GPU/CPU: compile dynamic shape (existing behavior)
+            logger.info("Compiling %d chunkwise GDN prefill blocks on %s ...",
+                        num_blocks, gdn_prefill_dev)
+            t0 = time.time()
+            for i in range(num_blocks):
+                ir = core.read_model(str(model_dir / f"gdn_prefill_block_{i}.xml"))
+                if gdn_prefill_dev in ("GPU", "NPU"):
+                    ir = self._add_f32_output_conversion(ir)
+                if i == 0:
+                    logger.info("  GDN prefill block inputs: %s",
+                                [(inp.get_any_name(), str(inp.partial_shape),
+                                  str(inp.element_type)) for inp in ir.inputs])
+                # Force FP32 inference: the Neumann series (7 matrix squarings)
+                # accumulates catastrophic precision loss in FP16.
+                config = {}
+                if gdn_prefill_dev == "GPU":
+                    config["INFERENCE_PRECISION_HINT"] = "f32"
+                compiled = core.compile_model(ir, gdn_prefill_dev, config)
+                self._gdn_prefill_requests.append(compiled.create_infer_request())
+            logger.info("  GDN prefill compilation: %.1fs", time.time() - t0)
+        else:
+            logger.info("No chunkwise GDN prefill blocks found, using Loop-based prefill")
+
         # --- Compile Attention blocks ---
         # Fixed-size KV cache (ScatterUpdate) enables stateful on ALL devices.
         # NPU: try stateful first; if it fails at runtime, can fall back to explicit.
@@ -156,22 +227,45 @@ class Qwen35HybridModel:
         else:
             self._init_kv_caches()
 
-        # --- Compile prefill Attention blocks (NPU, S=prefill_chunk_size) ---
+        # --- Compile prefill Attention blocks (NPU, descending powers of 2) ---
         self._prefill_chunk_size = prefill_chunk_size
-        self._attn_prefill_requests: List = []
+        self._attn_prefill_requests: dict[int, list] = {}  # chunk_size -> [req per block]
         if (prefill_chunk_size > 1 and attn_device == "NPU"
                 and not self._attn_stateful):
-            logger.info("Compiling %d prefill Attn blocks on NPU (S=%d) ...",
-                        num_blocks, prefill_chunk_size)
+            # Compile NPU attention for descending powers of 2: 16, 8, 4, 2
+            chunk_sizes = []
+            s = prefill_chunk_size
+            while s >= 2:
+                chunk_sizes.append(s)
+                s //= 2
+            logger.info("Compiling prefill Attn blocks on NPU for S=%s ...", chunk_sizes)
+            t0 = time.time()
+            for cs in chunk_sizes:
+                requests = []
+                for i in range(num_blocks):
+                    ir = core.read_model(str(model_dir / f"attn_block_{i}.xml"))
+                    ir = self._reshape_attn_static(ir, attn_past_seq, seq_len=cs)
+                    ir = self._add_f32_output_conversion(ir)
+                    npu_config = {"NPU_COMPILER_TYPE": "PREFER_PLUGIN"}
+                    compiled = core.compile_model(ir, "NPU", npu_config)
+                    requests.append(compiled.create_infer_request())
+                self._attn_prefill_requests[cs] = requests
+            logger.info("  Prefill Attn compilation (%d sizes): %.1fs", len(chunk_sizes), time.time() - t0)
+
+        # --- Compile GPU Attention blocks for HYBRID prefill ---
+        # When NPU handles decode attention, also compile on GPU for prefill.
+        # GPU supports dynamic shapes → one infer call for full prompt.
+        self._attn_gpu_prefill_requests: List = []
+        if (attn_device == "NPU" and not self._attn_stateful
+                and attn_gpu_prefill):
+            logger.info("Compiling %d Attn GPU prefill blocks (dynamic shape) ...", num_blocks)
             t0 = time.time()
             for i in range(num_blocks):
                 ir = core.read_model(str(model_dir / f"attn_block_{i}.xml"))
-                ir = self._reshape_attn_static(ir, attn_past_seq, seq_len=prefill_chunk_size)
                 ir = self._add_f32_output_conversion(ir)
-                npu_config = {"NPU_COMPILER_TYPE": "PREFER_PLUGIN"}
-                compiled = core.compile_model(ir, "NPU", npu_config)
-                self._attn_prefill_requests.append(compiled.create_infer_request())
-            logger.info("  Prefill Attn compilation: %.1fs", time.time() - t0)
+                compiled = core.compile_model(ir, "GPU")
+                self._attn_gpu_prefill_requests.append(compiled.create_infer_request())
+            logger.info("  Attn GPU prefill compilation: %.1fs", time.time() - t0)
 
         # --- Compile Head block (GPU) ---
         logger.info("Compiling Head on %s ...", head_device)
@@ -261,6 +355,19 @@ class Qwen35HybridModel:
                 elif "rec" in s.name:
                     s.state = ov.Tensor(np.zeros(rec_shape, dtype=np.float32))
 
+    def _init_gdn_prefill_states(self):
+        """Initialize explicit state buffers for chunkwise GDN prefill."""
+        conv_shape = (1, self._conv_dim, self._conv_kernel)
+        rec_shape = (1, self._num_v_heads, self._k_head_dim, self._v_head_dim)
+        self._gdn_prefill_conv_states = [
+            [np.zeros(conv_shape, dtype=np.float32) for _ in range(3)]
+            for _ in range(self._num_blocks)
+        ]
+        self._gdn_prefill_rec_states = [
+            [np.zeros(rec_shape, dtype=np.float32) for _ in range(3)]
+            for _ in range(self._num_blocks)
+        ]
+
     def _init_attn_states(self):
         """Initialize attention KV cache stateful variables.
 
@@ -307,6 +414,27 @@ class Qwen35HybridModel:
         ir.reshape(shapes)
         return ir
 
+    def _reshape_gdn_prefill_static(self, ir, seq_len: int):
+        """Reshape GDN prefill IR to static shapes for NPU compilation.
+
+        Uses set_partial_shape() + validate_nodes_and_infer_types() instead of
+        ir.reshape() to avoid breaking GroupConvolution nodes in the GDN graph.
+        """
+        shape_map = {
+            0: [1, seq_len, self._hidden_size],                                  # in_hidden
+            1: [1, seq_len],                                                     # in_mask
+            2: [1, self._conv_dim, self._conv_kernel],                           # in_conv0
+            3: [1, self._num_v_heads, self._k_head_dim, self._v_head_dim],       # in_rec0
+            4: [1, self._conv_dim, self._conv_kernel],                           # in_conv1
+            5: [1, self._num_v_heads, self._k_head_dim, self._v_head_dim],       # in_rec1
+            6: [1, self._conv_dim, self._conv_kernel],                           # in_conv2
+            7: [1, self._num_v_heads, self._k_head_dim, self._v_head_dim],       # in_rec2
+        }
+        for i, shape in shape_map.items():
+            ir.inputs[i].get_node().set_partial_shape(ov.PartialShape(shape))
+        ir.validate_nodes_and_infer_types()
+        return ir
+
     # -----------------------------------------------------------------
     # Forward pass
     # -----------------------------------------------------------------
@@ -323,12 +451,61 @@ class Qwen35HybridModel:
         req.infer()
         return req.get_output_tensor(0).data.copy()
 
+    def _run_gdn_prefill_block(self, block_idx: int, hidden: np.ndarray,
+                                attention_mask: np.ndarray) -> np.ndarray:
+        """Run one chunkwise GDN prefill block (3 layers) with explicit state I/O.
+
+        Unlike the stateful decode block, this takes/returns states explicitly.
+        States are read from and written to self._gdn_prefill_{conv,rec}_states.
+        """
+        req = self._gdn_prefill_requests[block_idx]
+        conv_states = self._gdn_prefill_conv_states[block_idx]
+        rec_states = self._gdn_prefill_rec_states[block_idx]
+
+        req.set_input_tensor(0, ov.Tensor(np.ascontiguousarray(hidden)))
+        req.set_input_tensor(1, ov.Tensor(np.ascontiguousarray(attention_mask)))
+        for j in range(3):
+            req.set_input_tensor(2 + j * 2, ov.Tensor(np.ascontiguousarray(conv_states[j])))
+            req.set_input_tensor(3 + j * 2, ov.Tensor(np.ascontiguousarray(rec_states[j])))
+        req.infer()
+
+        hidden_out = req.get_output_tensor(0).data.copy()
+        for j in range(3):
+            self._gdn_prefill_conv_states[block_idx][j] = req.get_output_tensor(1 + j * 2).data.copy()
+            self._gdn_prefill_rec_states[block_idx][j] = req.get_output_tensor(2 + j * 2).data.copy()
+        return hidden_out
+
+    def _run_gdn_prefill_block_npu(self, block_idx: int, hidden: np.ndarray,
+                                    attention_mask: np.ndarray, seq_len: int) -> np.ndarray:
+        """Run one chunkwise GDN prefill block on NPU with static shapes.
+
+        Same state management as _run_gdn_prefill_block but uses NPU
+        static-shape infer requests selected by seq_len.
+        """
+        req = self._gdn_prefill_npu_requests[seq_len][block_idx]
+        conv_states = self._gdn_prefill_conv_states[block_idx]
+        rec_states = self._gdn_prefill_rec_states[block_idx]
+
+        req.set_input_tensor(0, ov.Tensor(np.ascontiguousarray(hidden)))
+        req.set_input_tensor(1, ov.Tensor(np.ascontiguousarray(attention_mask)))
+        for j in range(3):
+            req.set_input_tensor(2 + j * 2, ov.Tensor(np.ascontiguousarray(conv_states[j])))
+            req.set_input_tensor(3 + j * 2, ov.Tensor(np.ascontiguousarray(rec_states[j])))
+        req.infer()
+
+        hidden_out = req.get_output_tensor(0).data.copy()
+        for j in range(3):
+            self._gdn_prefill_conv_states[block_idx][j] = req.get_output_tensor(1 + j * 2).data.copy()
+            self._gdn_prefill_rec_states[block_idx][j] = req.get_output_tensor(2 + j * 2).data.copy()
+        return hidden_out
+
     def _run_attn_block(self, block_idx: int, hidden: np.ndarray, position_ids: np.ndarray,
-                        use_prefill: bool = False) -> np.ndarray:
+                        use_prefill: bool = False, gpu_prefill: bool = False) -> np.ndarray:
         """Run one Attention block (1 layer) with fixed-size KV cache."""
         if self._attn_stateful:
             return self._run_attn_block_stateful(block_idx, hidden, position_ids)
-        return self._run_attn_block_explicit(block_idx, hidden, position_ids, use_prefill=use_prefill)
+        return self._run_attn_block_explicit(block_idx, hidden, position_ids,
+                                             use_prefill=use_prefill, gpu_prefill=gpu_prefill)
 
     def _run_attn_block_stateful(self, block_idx: int, hidden: np.ndarray, position_ids: np.ndarray) -> np.ndarray:
         """Run attention with stateful fixed-size KV cache.
@@ -355,7 +532,7 @@ class Qwen35HybridModel:
         return req.get_output_tensor(0).data.copy().reshape(batch_size, seq_len, -1)
 
     def _run_attn_block_explicit(self, block_idx: int, hidden: np.ndarray, position_ids: np.ndarray,
-                                  use_prefill: bool = False) -> np.ndarray:
+                                  use_prefill: bool = False, gpu_prefill: bool = False) -> np.ndarray:
         """Run attention with explicit fixed-size KV cache I/O.
 
         KV cache is transferred each step but no padding/compaction needed
@@ -369,9 +546,11 @@ class Qwen35HybridModel:
         attention_mask = self._build_attn_mask(batch_size, seq_len)
 
         # Explicit I/O: inputs are [hidden, position_ids, key_cache, value_cache, cache_position, attention_mask]
-        # Use prefill infer request (S=chunk_size) when available, else decode request (S=1)
-        if use_prefill and self._attn_prefill_requests:
-            req = self._attn_prefill_requests[block_idx]
+        # Select request: GPU prefill > NPU prefill > NPU decode
+        if gpu_prefill and self._attn_gpu_prefill_requests:
+            req = self._attn_gpu_prefill_requests[block_idx]
+        elif use_prefill and seq_len in self._attn_prefill_requests:
+            req = self._attn_prefill_requests[seq_len][block_idx]
         else:
             req = self._attn_requests[block_idx]
         req.set_input_tensor(0, ov.Tensor(np.ascontiguousarray(hidden)))
@@ -454,9 +633,8 @@ class Qwen35HybridModel:
 
         hidden = embeds
 
-        # Auto-detect prefill mode: use prefill requests when seq_len matches chunk size
-        use_prefill = (seq_len == self._prefill_chunk_size
-                       and len(self._attn_prefill_requests) > 0)
+        # Auto-detect prefill mode: use prefill requests when seq_len has a compiled model
+        use_prefill = seq_len in self._attn_prefill_requests
 
         for i in range(self._num_blocks):
             if profiling:
@@ -484,6 +662,139 @@ class Qwen35HybridModel:
 
         if profiling:
             self._profile_stats['total'].append(time.perf_counter() - t_total_start)
+
+        return logits
+
+    def prefill(self, token_ids: np.ndarray) -> np.ndarray:
+        """Optimized prefill: parallel GDN (GPU) + chunked attention (NPU).
+
+        Layer-major ordering: for each layer, run GDN on full prompt (one
+        GPU infer call), then chunk attention across NPU (multiple calls).
+
+        If chunkwise GDN prefill blocks are available (no Loop node), uses
+        parallel MatMul instead of sequential Loop — much faster for S>1.
+        Falls back to Loop-based GDN blocks if prefill blocks not exported.
+
+        Args:
+            token_ids: Shape [1, prompt_len] int64, full prompt.
+
+        Returns:
+            logits: Shape [1, 1, vocab_size] float32 (last token only).
+        """
+        batch_size, prompt_len = token_ids.shape
+        chunk_size = self._prefill_chunk_size
+        use_chunkwise = bool(self._gdn_prefill_requests) or bool(self._gdn_prefill_npu_requests)
+
+        # Initialize explicit prefill states if using chunkwise
+        if use_chunkwise:
+            self._init_gdn_prefill_states()
+
+        # Compute chunk boundaries for NPU attention
+        chunk_bounds = []  # [(start_pos, chunk_len), ...]
+        pos = 0
+        while pos < prompt_len:
+            remaining = prompt_len - pos
+            cs = chunk_size
+            while cs > remaining:
+                cs //= 2
+            if cs < 1:
+                cs = 1
+            chunk_bounds.append((pos, cs))
+            pos += cs
+
+        # Compute separate chunk bounds for GDN NPU prefill (max S=16)
+        use_gdn_npu = use_chunkwise and bool(self._gdn_prefill_npu_requests)
+        if use_gdn_npu:
+            gdn_max_chunk = max(self._gdn_prefill_npu_requests.keys())
+            gdn_chunk_bounds = []
+            gdn_pos = 0
+            while gdn_pos < prompt_len:
+                remaining = prompt_len - gdn_pos
+                cs = gdn_max_chunk
+                while cs > remaining:
+                    cs //= 2
+                if cs < 1:
+                    cs = 1
+                gdn_chunk_bounds.append((gdn_pos, cs))
+                gdn_pos += cs
+
+        # Embed full prompt
+        hidden = self._embed_table[token_ids]  # [B, prompt_len, H]
+
+        for layer_idx in range(self._num_blocks):
+            # --- GDN block ---
+            if use_gdn_npu:
+                # NPU: chunk GDN prefill (static shapes, max S=16)
+                gdn_outputs = []
+                for start, cs in gdn_chunk_bounds:
+                    chunk_hidden = hidden[:, start:start + cs, :]
+                    gdn_mask = np.ones((batch_size, cs), dtype=np.int64)
+                    gdn_outputs.append(
+                        self._run_gdn_prefill_block_npu(
+                            layer_idx, chunk_hidden, gdn_mask, cs))
+                hidden = np.concatenate(gdn_outputs, axis=1)
+            elif use_chunkwise:
+                # GPU: process full prompt at once (dynamic shape)
+                gdn_mask = np.ones((batch_size, prompt_len), dtype=np.int64)
+                hidden = self._run_gdn_prefill_block(layer_idx, hidden, gdn_mask)
+            else:
+                gdn_mask = np.ones((batch_size, prompt_len), dtype=np.int64)
+                hidden = self._run_gdn_block(layer_idx, hidden, gdn_mask)
+
+            # --- Attention block ---
+            if self._attn_stateful:
+                # GPU stateful: can process full prompt at once
+                self._past_length = 0
+                positions = np.arange(0, prompt_len, dtype=np.int64)
+                position_ids = np.tile(
+                    positions[np.newaxis, np.newaxis, :], (3, batch_size, 1))
+                hidden = self._run_attn_block(layer_idx, hidden, position_ids)
+            elif self._attn_gpu_prefill_requests:
+                # GPU explicit I/O prefill: process full prompt at once (dynamic shapes)
+                self._past_length = 0
+                positions = np.arange(0, prompt_len, dtype=np.int64)
+                position_ids = np.tile(
+                    positions[np.newaxis, np.newaxis, :], (3, batch_size, 1))
+                hidden = self._run_attn_block(
+                    layer_idx, hidden, position_ids, gpu_prefill=True)
+            else:
+                # NPU explicit I/O: process in chunks
+                attn_outputs = []
+                for start, cs in chunk_bounds:
+                    self._past_length = start
+                    chunk_hidden = hidden[:, start:start + cs, :]
+
+                    positions = np.arange(start, start + cs, dtype=np.int64)
+                    position_ids = np.tile(
+                        positions[np.newaxis, np.newaxis, :], (3, batch_size, 1))
+
+                    use_prefill = cs in self._attn_prefill_requests
+                    chunk_out = self._run_attn_block(
+                        layer_idx, chunk_hidden, position_ids,
+                        use_prefill=use_prefill)
+                    attn_outputs.append(chunk_out)
+
+                hidden = np.concatenate(attn_outputs, axis=1)
+
+        # Set past_length for decode phase
+        self._past_length = prompt_len
+
+        # Transfer chunkwise prefill states to stateful decode GDN blocks
+        if use_chunkwise:
+            for blk_idx in range(self._num_blocks):
+                for s in self._gdn_requests[blk_idx].query_state():
+                    for j in range(3):
+                        if f"conv{j}" in s.name:
+                            s.state = ov.Tensor(self._gdn_prefill_conv_states[blk_idx][j])
+                        elif f"rec{j}" in s.name:
+                            s.state = ov.Tensor(self._gdn_prefill_rec_states[blk_idx][j])
+
+        # Head: last token only (save ~6ms per skipped chunk)
+        last_hidden = hidden[:, -1:, :]
+        self._head_request.set_input_tensor(
+            0, ov.Tensor(np.ascontiguousarray(last_hidden)))
+        self._head_request.infer()
+        logits = self._head_request.get_output_tensor(0).data.copy()
 
         return logits
 
@@ -530,22 +841,14 @@ class Qwen35HybridModel:
         token_list = self._tokenizer.encode(prompt)
         input_ids = np.array([token_list], dtype=np.int64)  # [1, seq_len]
 
-        # Prefill — chunked (S=chunk_size) + remainder token-by-token (S=1)
+        # Prefill — layer-major (full-batch GDN + chunked attention)
         t0 = time.time()
         prompt_len = input_ids.shape[1]
         chunk_size = self._prefill_chunk_size
-        pos = 0
-        # Full chunks (S=chunk_size)
-        while pos + chunk_size <= prompt_len:
-            logits = self.forward(input_ids[:, pos:pos + chunk_size])
-            pos += chunk_size
-        # Remainder: token-by-token (S=1) — cannot pad because GDN Loop would process padding
-        while pos < prompt_len:
-            logits = self.forward(input_ids[:, pos:pos + 1])
-            pos += 1
+        logits = self.prefill(input_ids)
         prefill_time = time.time() - t0
         logger.info(
-            "Prefill: %d tokens in %.1fms (%.1f tok/s, chunk=%d)",
+            "Prefill: %d tokens in %.1fms (%.1f tok/s, chunk=%d, layer-major)",
             prompt_len, prefill_time * 1000, prompt_len / prefill_time, chunk_size,
         )
 
@@ -609,6 +912,10 @@ def main():
     parser.add_argument("--attn-past-seq", type=int, default=256, help="Static KV cache size for NPU")
     parser.add_argument("--no-attn-stateful", action="store_true", help="Use explicit KV I/O instead of stateful")
     parser.add_argument("--prefill-chunk-size", type=int, default=16, help="Prefill chunk size (1=token-by-token)")
+    parser.add_argument("--gdn-prefill-device", default=None, choices=["GPU", "NPU"],
+                        help="Device for GDN prefill blocks (default: same as gdn_device)")
+    parser.add_argument("--no-attn-gpu-prefill", action="store_true",
+                        help="Disable GPU attention for prefill (use NPU chunked instead)")
     args = parser.parse_args()
 
     device_map = {
@@ -626,10 +933,13 @@ def main():
         attn_past_seq=args.attn_past_seq,
         attn_stateful=not args.no_attn_stateful,
         prefill_chunk_size=args.prefill_chunk_size,
+        gdn_prefill_device=args.gdn_prefill_device,
+        attn_gpu_prefill=not args.no_attn_gpu_prefill,
     )
 
+    gdn_prefill_dev = args.gdn_prefill_device or gdn_dev
     print(f"\nPrompt: {args.prompt}")
-    print(f"Device: {args.device} (GDN={gdn_dev}, Attn={attn_dev}, Head={head_dev})")
+    print(f"Device: {args.device} (GDN={gdn_dev}, Attn={attn_dev}, Head={head_dev}, GDN-prefill={gdn_prefill_dev})")
     print("-" * 60)
 
     output = model.generate(args.prompt, max_new_tokens=args.max_tokens)

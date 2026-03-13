@@ -51,7 +51,7 @@ Qwen3.5 使用 **Gated Delta Networks (GDN) 混合架构**，不是标准 Transf
 |------|------|---------|--------|------|
 | CPU | 正常 | ~1.5 tok/s | ~3.6 tok/s | 稳定 |
 | **GPU_ONLY** | **正常** | **9.1 tok/s** | **22.6 tok/s** | 全 stateful，ScatterUpdate-3 KV cache |
-| **HYBRID (GPU+NPU) Python** | **正常** | **15.0 tok/s** | **14.9 tok/s** | GDN→GPU(stateful), Attn→NPU(explicit), chunked prefill S=16 |
+| **HYBRID (GPU+NPU) Python** | **正常** | **~60 tok/s** | **14.9 tok/s** | GDN→GPU(stateful), Attn→NPU(explicit), layer-major prefill (full-batch GDN + chunked attn S=16/8/4/2) |
 | **HYBRID (GPU+NPU) C++** | **正常** | **~6 tok/s** | **16-18 tok/s** | 同 Python 架构，零分配热循环，GPU set_output_tensor 零拷贝 |
 | NPU only | 不可用 | — | — | GDN 递归 FP16 精度不足 |
 
@@ -66,15 +66,16 @@ Intel NPU 不能单独跑完整模型（两个障碍）：
 
 对比：高通 SM8650 NPU 有 FP32 累加器 + TFLite 编译时展开 Loop → GDN 可正常推理。详见 `intel-npu-gdn.md`。
 
-## Hybrid GPU+NPU 推理（13 子图方案）
+## Hybrid GPU+NPU 推理（19 子图方案）
 
 ### 架构
 
-将 24 层拆为 13 个独立子图 IR：
+将 24 层拆为 19 个独立子图 IR：
 
 | 子图 | 数量 | 设备 | State 管理 | 内容 |
 |------|------|------|-----------|------|
-| GDN block | 6 | GPU | **Stateful**（ReadValue/Assign，state 常驻 GPU 显存） | 每块 3 层 GDN（含 Loop 节点，需 FP32） |
+| GDN block (decode) | 6 | GPU | **Stateful**（ReadValue/Assign，state 常驻 GPU 显存） | 每块 3 层 GDN（含 Loop 节点，需 FP32） |
+| GDN prefill block | 6 | GPU | **Explicit I/O**（state 显式传入传出） | 每块 3 层 GDN（chunkwise parallel，无 Loop，90 MatMul） |
 | Attention block | 6 | GPU/NPU | **GPU: Stateful**（KV cache 常驻 GPU）/ NPU: Explicit I/O | 每块 1 层 full attention（标准 SDPA，FP16 ok） |
 | Head block | 1 | GPU | 无状态 | RMSNorm + lm_head |
 
@@ -92,7 +93,7 @@ GPU_ONLY 总加速：8.6 → 13.6 tok/s (+58%)，消除每 token 41MB+ host↔GP
 
 **导出**（qwen35 venv）：
 ```powershell
-uv run --project qwen35 python -m qwen35.export_hybrid
+uv run --project qwen35 python -m qwen35.export_hybrid --kv-update-method scatter_update_ext
 ```
 
 **推理**（根 venv）：
@@ -104,7 +105,7 @@ uv run python -m qwen35.inference_hybrid --prompt "你好" --device HYBRID --no-
 
 ### NPU Attention 关键设计
 
-1. **静态 shape**：NPU 要求 static shape，KV cache 固定到 `MAX_CACHE=256`，不足部分零填充。编译两套模型：S=1（decode）+ S=16（prefill chunks）
+1. **静态 shape**：NPU 要求 static shape，KV cache 固定到 `MAX_CACHE=256`，不足部分零填充。编译多套模型：S=1（decode）+ S=16/8/4/2（prefill，descending powers of 2 消除 token-by-token remainder）
 2. **attention_mask 必须有**：零填充的 KV 位置在 softmax 中得到 `exp(0)=1` 的非零权重，导致 attention 稀释。必须传入 4D mask `[B, 1, query_seq, key_seq]`，padded 位置用 `-65504.0`（fp16 最小值）屏蔽
 3. **Position 0 始终 masked**：KV cache 初始化有 dummy entry（position 0），attention_mask 对 position 0 也填 `-65504.0`
 
@@ -159,7 +160,7 @@ NPU explicit I/O 仍用 `past_seq=1`（dummy entry），需 mask position 0。
 
 | PyTorch 操作 | OV IR 操作 | GPU 正确性 | NPU 正确性 | GPU stateful 速度 | 备注 |
 |-------------|-----------|-----------|-----------|-----------------|------|
-| `torch.where` (select) | Select | ✓ | ✓ | 13.6 tok/s | 慢但通用 |
+| `torch.where` (select) | Select | ✓ | ✓ | 13.6 tok/s | 慢且不支持 S>1 prefill（expand_as 失败） |
 | `torch.index_copy_` | ScatterElementsUpdate | ✓ | ✗ 乱码 | — | NPU 有 bug |
 | `torch.scatter` | ScatterElementsUpdate | ✓ | ✗ 乱码 | — | NPU 有 bug |
 | `torch.index_put` | — | — | — | — | OV 前端不支持 |
@@ -195,41 +196,45 @@ NPU stateful（ReadValue/Assign）在子图模式下有固有开销：
 1. **ScatterUpdate-3 KV cache** ✓ — GPU_ONLY 13.6→22.6 tok/s (+66%)，HYBRID 15.3→17.6 tok/s (+15%)
 2. **NPU 模型缓存** ✓ — `core.set_property({"CACHE_DIR": ...})` 全局设置，首次编译后 <1s 启动
 3. **PREFER_PLUGIN 编译器** ✓ — 已在 NPU attn block 编译时设置 `"NPU_COMPILER_TYPE": "PREFER_PLUGIN"`
-4. **Chunked prefill (S=16)** ✓ — NPU 编译第二套 S=16 attention 模型，prefill 10.9→15.0 tok/s (+38%)。44 token prompt: 2 full chunks + 12 remainder。首次编译 +7s，后续 cached <1s。`--prefill-chunk-size 16`
+4. **Chunked prefill (S=16,8,4,2)** ✓ — NPU 编译多套 attention 模型（descending powers of 2），prefill 10.9→15.0 tok/s (+38%)。44 token prompt: 16+16+8+4 = 4 chunks（vs 旧版 16+16+12×S=1 = 14 forward calls）。首次编译 +7s，后续 cached <1s。`--prefill-chunk-size 16`
+5. **Layer-major prefill** ✓ — 将 chunk-major（每个 chunk 穿过所有 13 层）改为 layer-major（每层处理所有 token），GDN 用 full-batch（S=prompt_len，一次 GPU infer），Attn 仍分 chunk（NPU static shapes）。Head 只在最后一个 token 运行一次。**HYBRID 1.3-1.4x prefill 加速**（41 tok: 900→678ms），GPU_ONLY 同样受益。优化来源：6x 更少 GDN kernel dispatch + 跳过 N-1 次 Head + GDN Loop 单次启动摊销
+6. **Chunkwise parallel GDN prefill** ✓ — 用 WY representation 并行化 GDN prefill，消除 Loop 节点。`ChunkwiseRecurrentAttentionCell`（`chunkwise_gdn.py`）用 MatMul+tril+cumsum+exp 替代逐 token Loop，OV 直接 trace（无需 ModuleExtension）。导出为 `gdn_prefill_block_{0-5}.xml`（888 ops, 90 MatMul, 0 Loop），推理时 prefill 用 chunkwise blocks、decode 仍用 Loop blocks。**Prefill 2x 加速**（49 tok: 11.6→23.6 tok/s）。Neumann series 8 步（支持 T≤256），需 FP32 精度（`compress_to_fp16=False` + `INFERENCE_PRECISION_HINT=f32`）。Prefill 后通过 `query_state()` 将 chunkwise explicit states 注入 stateful decode blocks
 
 #### 已验证无效（Lunar Lake 统一内存架构下的反优化）
 
 4. **GPU-side argmax** ✗ — 在 HeadWrapper IR 中加 `torch.argmax` 导致 Head 从 6ms → 34ms（+28ms）。Intel iGPU 的 argmax kernel 对 248320 元素极慢。而 Lunar Lake 统一内存下 GPU→CPU 传 1MB logits 几乎零成本（cache coherent，非 PCIe），CPU numpy argmax 仅 ~0.1ms。**结论：统一内存架构下 argmax 应留在 CPU**
 5. **Embedding 上 GPU** ✗ — GPU Gather 子图 0.6ms vs CPU numpy 索引 0.02ms（慢 30x）。额外的 OV model launch + GPU kernel 调度开销远大于收益。且 485MB embedding 表常驻 GPU VRAM 增加显存压力。**结论：embedding 查表应留在 CPU numpy**
 6. **NPU set_output_tensor 零拷贝 KV** ✗ — 对 NPU attn block 用 `set_output_tensor(1/2, kv_tensors)` 消除 KV memcpy，但因 input/output 指向同一 host buffer，NPU 插件内部增加了额外拷贝来处理 aliased memory，导致 decode 从 ~17 tok/s 降到 ~9 tok/s（2x 减速）。**结论：NPU 不适合 aliased input/output，保留显式 memcpy**。GPU `set_output_tensor` 无此问题（GPU 插件用独立 GPU 内存做中间计算）
+7. **GPU attention prefill** ✗ — 在 HYBRID 模式 prefill 时将 attention 放 GPU（动态 shape，一次调用处理全 prompt）而非 NPU（chunked S=16/8/4/2）。结果 prefill 反而 0.79x 更慢。原因：GPU 已在跑 GDN（占 73% 时间），再加 attention 造成 GPU 争抢。NPU chunked prefill 已经和 GPU_ONLY 持平 (1.01x)。**结论：HYBRID prefill 时 attention 应保留在 NPU**。代码仍保留（`--no-attn-gpu-prefill` 默认关闭），可供对比
+8. **PERFORMANCE_HINT: LATENCY** ✗ — 在 Python inference 中对 GPU/NPU 所有子图设置 `PERFORMANCE_HINT: LATENCY`（C++ 版已使用）。结果 Python 版 decode 从 ~14 tok/s 降到 ~9.7 tok/s（**30% 退化**）。C++ 用 LATENCY 有效可能因为 C++ 调用路径不同。**结论：Python OpenVINO API 不应设置 LATENCY hint**
+9. **Prefill 后释放 GPU 内存** ✗ — Prefill 完成后释放 GDN prefill blocks + attention prefill blocks（~1.5GB GPU）。A/B 测试无改善（0.94x），GPU memory pressure 假说不成立。**结论：OpenVINO CompiledModel 内存不影响其他模型推理速度**
 
 #### 待尝试优化
 
-6. **Async pipeline** — GDN（GPU）和 Attn（NPU）目前串行执行。理论上可用 `start_async()` 做 overlap：当 NPU 推理 attn_block_i 时，GPU 可预热 gdn_block_{i+1}。但 pipeline 设计需要小心依赖关系
-7. ~~**KV cache INT8 量化**~~ → 权重量化已提供足够压缩和加速，KV cache 量化优先级降低
-8. ✓ **Attention block 权重 INT4** → 已验证 INT4_SYM 安全，见量化实验结果
-9. ~~**Batch prefill**~~ → 已实现为 **Chunked prefill**（见已验证 #4）
+所有主要优化方向已探索完毕。剩余方向均为增量改善：
+- ~~**Async pipeline**~~ ✗ — 数据依赖链 `gdn_i → attn_i → gdn_{i+1}` 严格串行，无法并行
+- ~~**KV cache INT8 量化**~~ → 权重量化已足够
+- ✓ **Attention block 权重 INT4** → 已验证 INT4_SYM 安全
+- ~~**Batch prefill**~~ → 已实现为 Chunked prefill
+- ~~**GPU attention prefill**~~ ✗ → GPU 争抢
+- ~~**LATENCY hint**~~ ✗ → Python API 不兼容
 
 #### 瓶颈分析（profiling 实测，含 profiling overhead）
 
-**GPU_ONLY**（15.4 tok/s with profiling，无 profiling ~22 tok/s，77ms/token）：
-- GDN blocks x 6：50ms（64.5%）— 主要瓶颈
-- Attn blocks x 6：21ms（27.3%）
-- Head：6.3ms（8.1%）
-- Embed + Python：0.1ms
+**HYBRID NPU explicit**（7.9 tok/s with profiling，无 profiling ~11-14 tok/s）：
+- GDN blocks x 6：95.2ms（**73.6%**）— 绝对主导瓶颈
+- Attn blocks x 6：24.2ms（18.7%）— NPU ~4ms/block
+- Head：9.7ms（7.5%）
+- Python overhead：0.15ms（**0.1%**）— 几乎为零
 
-**HYBRID NPU explicit**（15.3 tok/s with profiling，无 profiling ~17 tok/s，74ms/token）：
-- GDN blocks x 6：51ms（69.2%）— 主要瓶颈
-- Attn blocks x 6：16ms（21.9%）— NPU 比 GPU 快 24%
-- Head：6.5ms（8.8%）
-- Embed + Python：0.1ms
+**关键结论**：Python overhead 可以忽略不计（0.1%），性能差距完全在 OpenVINO 运行时。GDN blocks 占 73.6%，是唯一值得优化的目标。但 GDN 需要 FP32 + Loop 节点在 GPU 上运行，优化空间已接近极限。
 
-主要瓶颈是 GDN blocks（占 65-70%）。NPU attn blocks 已经比 GPU 快，但 GDN 占绝对主导。
+**注意**：Lunar Lake 有严重的热节流问题，GPU 时钟会动态调整。连续多次 GPU 密集运行后性能可能降到正常值的 50%。benchmark 数据必须考虑热状态。
 
 ### 量化实验结果
 
 **工具**:
-- `qwen35/scripts/quantize_hybrid.py` — 对已导出的 hybrid IR 做 per-subgraph NNCF 权重压缩
+- `qwen35/scripts/quantize_hybrid.py` — 对已导出的 hybrid IR 做 per-subgraph NNCF 权重压缩（含 GDN prefill blocks）
 - `qwen35/scripts/test_quality.py` — 6 个多样 prompt 质量对比测试
 
 **量化配方**:
@@ -261,8 +266,9 @@ uv run python -m qwen35.scripts.test_quality --model-dir models/qwen35/Qwen3.5-0
 
 | 模块 | 职责 |
 |------|------|
-| `export_hybrid.py` | 导出 13 子图 IR（GDN/Attention/Head blocks），显式 I/O |
-| `inference_hybrid.py` | `Qwen35HybridModel` — 编排 13 子图推理，GDN stateful + Attn explicit I/O，chunked prefill (S=16) |
+| `export_hybrid.py` | 导出 19 子图 IR（GDN decode/prefill + Attention + Head blocks） |
+| `chunkwise_gdn.py` | `ChunkwiseRecurrentAttentionCell` — WY representation 并行 GDN prefill（无 Loop，纯 MatMul） |
+| `inference_hybrid.py` | `Qwen35HybridModel` — 编排 19 子图推理，chunkwise GDN prefill + Loop GDN decode + chunked Attn |
 | `cpp/` | C++ hybrid 推理（同架构，16-18 tok/s decode），见下方 |
 | `scripts/run_inference.py` | 统一入口，`--device HYBRID/GPU_ONLY/CPU_ONLY` |
 | `scripts/quantize_hybrid.py` | Per-subgraph NNCF 权重量化（Attn INT4 / GDN INT8 / Head INT4） |
@@ -375,8 +381,9 @@ models/qwen35/
 │   ├── config.json
 │   ├── tokenizer.json
 │   └── tokenizer_config.json
-├── Qwen3.5-0.8B-hybrid/          # 13 子图（Hybrid GPU+NPU 推理）
-│   ├── gdn_block_{0-5}.xml/.bin  # 6 个 GDN 子图 (各 3 层, GPU)
+├── Qwen3.5-0.8B-hybrid/          # 19 子图（Hybrid GPU+NPU 推理）
+│   ├── gdn_block_{0-5}.xml/.bin  # 6 个 GDN decode 子图 (各 3 层, Loop, GPU stateful)
+│   ├── gdn_prefill_block_{0-5}.xml/.bin # 6 个 GDN prefill 子图 (chunkwise parallel, GPU explicit I/O)
 │   ├── attn_block_{0-5}.xml/.bin # 6 个 Attention 子图 (各 1 层, NPU)
 │   ├── head_block.xml/.bin       # Head 子图 (norm+lm_head, GPU)
 │   ├── embed_tokens.npy

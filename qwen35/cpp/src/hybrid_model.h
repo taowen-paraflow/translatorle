@@ -3,6 +3,7 @@
 
 #include <string>
 #include <vector>
+#include <map>
 #include <memory>
 #include <openvino/openvino.hpp>
 
@@ -63,6 +64,11 @@ private:
     /// Pointer valid until next forward() call. If run_head=false, returns nullptr.
     const float* forward(const int64_t* token_ids, int seq_len, bool run_head = true);
 
+    /// Layer-major prefill: full-batch GDN (GPU) + chunked attention (NPU).
+    /// Returns pointer to last token's logits. More efficient than calling
+    /// forward() per chunk: fewer GDN dispatches, head runs once, Loop amortized.
+    const float* prefill(const int64_t* token_ids, int prompt_len);
+
     void run_gdn_block(int block_idx, int seq_len);
     void run_attn_block(int block_idx, int seq_len, bool use_prefill);
     void fill_attn_mask(int seq_len);
@@ -87,9 +93,9 @@ private:
     std::vector<ov::CompiledModel> attn_models_;
     std::vector<ov::InferRequest> attn_requests_;
 
-    // Attention blocks — NPU, explicit I/O, S=prefill_chunk_size (prefill)
-    std::vector<ov::CompiledModel> attn_prefill_models_;
-    std::vector<ov::InferRequest> attn_prefill_requests_;
+    // Attention blocks — NPU, explicit I/O, S=2/4/8/16 (prefill, descending powers of 2)
+    std::map<int, std::vector<ov::CompiledModel>> attn_prefill_models_;
+    std::map<int, std::vector<ov::InferRequest>> attn_prefill_requests_;
 
     // Head block — GPU, stateless
     ov::CompiledModel head_model_;
@@ -116,12 +122,12 @@ private:
     ov::Tensor s1_cache_pos_;   // [1] wrapping cache_pos_buf_
     ov::Tensor s1_attn_mask_;   // [1, 1, 1, P] wrapping attn_mask_buf_
 
-    // Pre-allocated tensor wrappers — prefill (S=chunk_size)
-    ov::Tensor sc_hidden_;      // [1, C, hidden_size] wrapping hidden_buf_
-    ov::Tensor sc_gdn_mask_;    // [1, C] wrapping gdn_mask_buf_
-    ov::Tensor sc_pos_;         // [3, 1, C] wrapping pos_buf_
-    ov::Tensor sc_cache_pos_;   // [C] wrapping cache_pos_buf_
-    ov::Tensor sc_attn_mask_;   // [1, 1, C, P] wrapping attn_mask_buf_
+    // Pre-allocated tensor wrappers — prefill (S=2/4/8/16, one set per chunk size)
+    std::map<int, ov::Tensor> sc_hidden_;      // [1, C, hidden_size] wrapping hidden_buf_
+    std::map<int, ov::Tensor> sc_gdn_mask_;    // [1, C] wrapping gdn_mask_buf_
+    std::map<int, ov::Tensor> sc_pos_;         // [3, 1, C] wrapping pos_buf_
+    std::map<int, ov::Tensor> sc_cache_pos_;   // [C] wrapping cache_pos_buf_
+    std::map<int, ov::Tensor> sc_attn_mask_;   // [1, 1, C, P] wrapping attn_mask_buf_
 
     // Tokenizer
     std::unique_ptr<OVTokenizer> tokenizer_;

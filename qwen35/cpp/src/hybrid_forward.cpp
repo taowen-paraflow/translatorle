@@ -18,9 +18,9 @@ void Qwen35HybridModel::run_gdn_block(int block_idx, int seq_len) {
     auto& req = gdn_requests_[block_idx];
 
     bool is_decode = (seq_len == 1);
-    auto& hidden = is_decode ? s1_hidden_ : sc_hidden_;
+    auto& hidden = is_decode ? s1_hidden_ : sc_hidden_.at(seq_len);
     req.set_input_tensor(0, hidden);
-    req.set_input_tensor(1, is_decode ? s1_gdn_mask_ : sc_gdn_mask_);
+    req.set_input_tensor(1, is_decode ? s1_gdn_mask_ : sc_gdn_mask_.at(seq_len));
     // Zero-copy: GPU copies input to GPU memory before processing, then writes
     // output from GPU memory back to host. Safe to share the same host buffer.
     req.set_output_tensor(0, hidden);
@@ -33,11 +33,11 @@ void Qwen35HybridModel::run_gdn_block(int block_idx, int seq_len) {
 // ---------------------------------------------------------------------------
 
 void Qwen35HybridModel::run_attn_block(int block_idx, int seq_len, bool use_prefill) {
-    auto& req = use_prefill ? attn_prefill_requests_[block_idx]
+    auto& req = use_prefill ? attn_prefill_requests_.at(seq_len)[block_idx]
                             : attn_requests_[block_idx];
     bool is_decode = (seq_len == 1);
 
-    auto& hidden = is_decode ? s1_hidden_ : sc_hidden_;
+    auto& hidden = is_decode ? s1_hidden_ : sc_hidden_.at(seq_len);
     req.set_input_tensor(0, hidden);
 
     for (int c = 0; c < 3; ++c) {
@@ -45,7 +45,7 @@ void Qwen35HybridModel::run_attn_block(int block_idx, int seq_len, bool use_pref
             pos_buf_[c * seq_len + s] = past_length_ + s;
         }
     }
-    req.set_input_tensor(1, is_decode ? s1_pos_ : sc_pos_);
+    req.set_input_tensor(1, is_decode ? s1_pos_ : sc_pos_.at(seq_len));
 
     req.set_input_tensor(2, kv_key_tensors_[block_idx]);
     req.set_input_tensor(3, kv_value_tensors_[block_idx]);
@@ -53,10 +53,10 @@ void Qwen35HybridModel::run_attn_block(int block_idx, int seq_len, bool use_pref
     for (int s = 0; s < seq_len; ++s) {
         cache_pos_buf_[s] = past_length_ + s;
     }
-    req.set_input_tensor(4, is_decode ? s1_cache_pos_ : sc_cache_pos_);
+    req.set_input_tensor(4, is_decode ? s1_cache_pos_ : sc_cache_pos_.at(seq_len));
 
     fill_attn_mask(seq_len);
-    req.set_input_tensor(5, is_decode ? s1_attn_mask_ : sc_attn_mask_);
+    req.set_input_tensor(5, is_decode ? s1_attn_mask_ : sc_attn_mask_.at(seq_len));
 
     req.infer();
 
@@ -114,9 +114,8 @@ const float* Qwen35HybridModel::forward(
                     H * sizeof(float));
     }
 
-    // Auto-detect prefill mode
-    bool use_prefill = (seq_len == prefill_chunk_size_
-                        && !attn_prefill_requests_.empty());
+    // Auto-detect prefill mode — any compiled chunk size triggers prefill
+    bool use_prefill = (attn_prefill_requests_.count(seq_len) > 0);
 
     // 6 × (GDN → Attn)
     for (int i = 0; i < cfg_.num_blocks; ++i) {
@@ -142,6 +141,160 @@ const float* Qwen35HybridModel::forward(
 }
 
 // ---------------------------------------------------------------------------
+// Layer-major prefill: full-batch GDN (GPU) + chunked attention (NPU)
+// ---------------------------------------------------------------------------
+
+const float* Qwen35HybridModel::prefill(const int64_t* token_ids, int prompt_len) {
+    int H = cfg_.hidden_size;
+    int P = attn_past_seq_;
+    int C = prefill_chunk_size_;
+    auto prefill_t0 = std::chrono::steady_clock::now();
+
+    // Compute chunk boundaries for NPU attention
+    struct Chunk { int start; int len; };
+    std::vector<Chunk> chunks;
+    int pos = 0;
+    while (pos < prompt_len) {
+        int remaining = prompt_len - pos;
+        int cs = C;
+        while (cs > remaining) cs /= 2;
+        if (cs < 1) cs = 1;
+        chunks.push_back({pos, cs});
+        pos += cs;
+    }
+
+    // Allocate full-prompt buffer (once per generation, negligible overhead)
+    std::vector<float> full_hidden(prompt_len * H);
+
+    // Embedding lookup
+    for (int i = 0; i < prompt_len; ++i) {
+        std::memcpy(full_hidden.data() + i * H,
+                    embed_table_.data() + token_ids[i] * H,
+                    H * sizeof(float));
+    }
+
+    // GDN mask: all ones, sized for full prompt
+    std::vector<int64_t> full_gdn_mask(prompt_len, 1LL);
+
+    // Create tensor wrappers for full-prompt GDN
+    ov::Tensor full_hidden_tensor(ov::element::f32,
+        {1, static_cast<size_t>(prompt_len), static_cast<size_t>(H)},
+        full_hidden.data());
+    ov::Tensor full_mask_tensor(ov::element::i64,
+        {1, static_cast<size_t>(prompt_len)},
+        full_gdn_mask.data());
+
+    // --- Timing arrays ---
+    std::vector<double> gdn_times(cfg_.num_blocks, 0.0);
+    std::vector<double> attn_times(cfg_.num_blocks, 0.0);
+    // Per-layer per-chunk timing: attn_chunk_times[layer][chunk_idx]
+    std::vector<std::vector<double>> attn_chunk_times(
+        cfg_.num_blocks, std::vector<double>(chunks.size(), 0.0));
+
+    for (int layer = 0; layer < cfg_.num_blocks; ++layer) {
+        // --- GDN block (GPU): full prompt at once ---
+        auto gdn_t0 = std::chrono::steady_clock::now();
+        auto& gdn_req = gdn_requests_[layer];
+        gdn_req.set_input_tensor(0, full_hidden_tensor);
+        gdn_req.set_input_tensor(1, full_mask_tensor);
+        gdn_req.set_output_tensor(0, full_hidden_tensor);
+        gdn_req.infer();
+        gdn_times[layer] = elapsed_ms(gdn_t0);
+
+        // --- Attention block (NPU): chunked ---
+        auto attn_layer_t0 = std::chrono::steady_clock::now();
+        for (size_t ci = 0; ci < chunks.size(); ++ci) {
+            auto& chunk = chunks[ci];
+            int cs = chunk.len;
+            past_length_ = chunk.start;
+
+            // Copy chunk hidden from full buffer to hidden_buf_
+            std::memcpy(hidden_buf_.data(),
+                        full_hidden.data() + chunk.start * H,
+                        cs * H * sizeof(float));
+
+            auto attn_chunk_t0 = std::chrono::steady_clock::now();
+            // Run attention via existing method (uses hidden_buf_)
+            bool use_prefill = attn_prefill_requests_.count(cs) > 0;
+            run_attn_block(layer, cs, use_prefill);
+            attn_chunk_times[layer][ci] = elapsed_ms(attn_chunk_t0);
+
+            // Copy result back to full buffer
+            std::memcpy(full_hidden.data() + chunk.start * H,
+                        hidden_buf_.data(),
+                        cs * H * sizeof(float));
+        }
+        attn_times[layer] = elapsed_ms(attn_layer_t0);
+    }
+
+    // Set past_length for decode phase
+    past_length_ = prompt_len;
+
+    // Head: last token only
+    std::memcpy(hidden_buf_.data(),
+                full_hidden.data() + (prompt_len - 1) * H,
+                H * sizeof(float));
+    head_request_.set_input_tensor(0, s1_hidden_);
+    auto head_t0 = std::chrono::steady_clock::now();
+    head_request_.infer();
+    double head_ms = elapsed_ms(head_t0);
+
+    double total_ms = elapsed_ms(prefill_t0);
+
+    // --- Print timing breakdown ---
+    double gdn_total = 0, attn_total = 0;
+    std::string gdn_line = "  GDN : ";
+    for (int i = 0; i < cfg_.num_blocks; ++i) {
+        gdn_total += gdn_times[i];
+        gdn_line += "[" + std::to_string(i) + "]=" +
+                    std::to_string(gdn_times[i]).substr(0, std::to_string(gdn_times[i]).find('.') + 2) +
+                    "ms ";
+    }
+    gdn_line += " total=" + std::to_string(gdn_total).substr(0, std::to_string(gdn_total).find('.') + 2) + "ms";
+
+    std::string attn_line = "  Attn: ";
+    for (int i = 0; i < cfg_.num_blocks; ++i) {
+        attn_total += attn_times[i];
+        attn_line += "[" + std::to_string(i) + "]=" +
+                     std::to_string(attn_times[i]).substr(0, std::to_string(attn_times[i]).find('.') + 2) +
+                     "ms ";
+    }
+    attn_line += " total=" + std::to_string(attn_total).substr(0, std::to_string(attn_total).find('.') + 2) + "ms";
+
+    // Chunk breakdown: show per-chunk sizes and per-layer timing
+    std::string chunk_hdr = "  Chunks: ";
+    for (size_t ci = 0; ci < chunks.size(); ++ci) {
+        chunk_hdr += "S=" + std::to_string(chunks[ci].len);
+        if (ci + 1 < chunks.size()) chunk_hdr += ",";
+    }
+
+    // Per-layer per-chunk detail
+    std::string chunk_detail;
+    for (int layer = 0; layer < cfg_.num_blocks; ++layer) {
+        chunk_detail += "  Attn[" + std::to_string(layer) + "] chunks: ";
+        for (size_t ci = 0; ci < chunks.size(); ++ci) {
+            std::string val = std::to_string(attn_chunk_times[layer][ci]);
+            val = val.substr(0, val.find('.') + 2);
+            chunk_detail += "S" + std::to_string(chunks[ci].len) + "=" + val + "ms ";
+        }
+        chunk_detail += "\n";
+    }
+
+    log("=== Prefill Timing (" + std::to_string(prompt_len) + " tokens) ===");
+    log(gdn_line);
+    log(attn_line);
+    log(chunk_hdr);
+    log(chunk_detail);
+    log("  Head: " + std::to_string(head_ms).substr(0, std::to_string(head_ms).find('.') + 2) + "ms");
+    log("  Total prefill: " + std::to_string(total_ms).substr(0, std::to_string(total_ms).find('.') + 2) + "ms");
+    log("  Breakdown: GDN " + std::to_string(gdn_total / total_ms * 100).substr(0, 4) + "% + Attn " +
+        std::to_string(attn_total / total_ms * 100).substr(0, 4) + "% + Head " +
+        std::to_string(head_ms / total_ms * 100).substr(0, 4) + "%");
+
+    return head_request_.get_output_tensor(0).data<const float>();
+}
+
+// ---------------------------------------------------------------------------
 // Generate
 // ---------------------------------------------------------------------------
 
@@ -159,29 +312,18 @@ std::string Qwen35HybridModel::generate(const std::string& prompt, int max_new_t
     log("Prompt tokens: " + std::to_string(prompt_len) +
         " (chunk=" + std::to_string(chunk_size) + ")");
 
-    // --- Prefill: chunked (S=chunk_size) + remainder token-by-token (S=1) ---
+    // --- Prefill: layer-major (full-batch GDN + chunked NPU attention) ---
+    // Each layer: GDN processes full prompt at once (GPU), then attention
+    // processes in chunks (NPU, S=16/8/4/2). Fewer GDN dispatches, head
+    // runs once, Loop amortized.
     auto t0 = std::chrono::steady_clock::now();
-    int pos = 0;
-    const float* logits = nullptr;
-
-    // Full chunks — skip Head for non-last chunks (saves ~6ms per chunk)
-    while (pos + chunk_size <= prompt_len) {
-        bool is_last = (pos + chunk_size >= prompt_len);
-        logits = forward(input_ids.data() + pos, chunk_size, /*run_head=*/is_last);
-        pos += chunk_size;
-    }
-    // Remainder tokens (S=1) — cannot pad because GDN Loop would process padding
-    while (pos < prompt_len) {
-        bool is_last = (pos + 1 >= prompt_len);
-        logits = forward(input_ids.data() + pos, 1, /*run_head=*/is_last);
-        pos += 1;
-    }
+    const float* logits = prefill(input_ids.data(), prompt_len);
 
     double prefill_ms = elapsed_ms(t0);
     log("Prefill: " + std::to_string(prompt_len) + " tokens in " +
         std::to_string(prefill_ms) + " ms (" +
         std::to_string(prompt_len / (prefill_ms / 1000.0)) + " tok/s, chunk=" +
-        std::to_string(chunk_size) + ")");
+        std::to_string(chunk_size) + ", layer-major)");
 
     // --- Greedy decode ---
     int V = cfg_.vocab_size;

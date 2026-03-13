@@ -196,41 +196,58 @@ void Qwen35HybridModel::load_attn_blocks(const std::string& model_dir) {
     }
     log("  Attn decode compilation: " + std::to_string(elapsed_ms(t0)) + " ms");
 
-    // --- Prefill models (S=chunk_size) ---
+    // --- Prefill models (descending powers of 2: 16, 8, 4, 2) ---
     if (C > 1) {
-        log("Compiling " + std::to_string(N) + " prefill Attn blocks on NPU (S=" +
-            std::to_string(C) + ")...");
+        // Collect chunk sizes: e.g. 16 -> {16, 8, 4, 2}
+        std::vector<int> chunk_sizes;
+        for (int cs = C; cs >= 2; cs /= 2)
+            chunk_sizes.push_back(cs);
+
+        std::string sizes_str;
+        for (size_t si = 0; si < chunk_sizes.size(); ++si) {
+            if (si > 0) sizes_str += ",";
+            sizes_str += std::to_string(chunk_sizes[si]);
+        }
+        log("Compiling " + std::to_string(N) + " prefill Attn blocks on NPU for S=[" +
+            sizes_str + "]...");
         t0 = std::chrono::steady_clock::now();
 
-        for (int i = 0; i < N; ++i) {
-            std::string xml = model_dir + "/attn_block_" + std::to_string(i) + ".xml";
-            auto model = core_.read_model(xml);
+        for (int cs : chunk_sizes) {
+            std::vector<ov::CompiledModel> models;
+            std::vector<ov::InferRequest> requests;
+            for (int i = 0; i < N; ++i) {
+                std::string xml = model_dir + "/attn_block_" + std::to_string(i) + ".xml";
+                auto model = core_.read_model(xml);
 
-            std::map<std::string, ov::PartialShape> shapes;
-            auto inputs = model->inputs();
-            for (size_t idx = 0; idx < inputs.size(); ++idx) {
-                std::string name = inputs[idx].get_any_name();
-                switch (idx) {
-                    case 0: shapes[name] = {1, C, hidden}; break;
-                    case 1: shapes[name] = {3, 1, C}; break;
-                    case 2: case 3: shapes[name] = {1, H, P, D}; break;
-                    case 4: shapes[name] = {C}; break;
-                    case 5: shapes[name] = {1, 1, C, P}; break;
+                std::map<std::string, ov::PartialShape> shapes;
+                auto inputs = model->inputs();
+                for (size_t idx = 0; idx < inputs.size(); ++idx) {
+                    std::string name = inputs[idx].get_any_name();
+                    switch (idx) {
+                        case 0: shapes[name] = {1, cs, hidden}; break;
+                        case 1: shapes[name] = {3, 1, cs}; break;
+                        case 2: case 3: shapes[name] = {1, H, P, D}; break;
+                        case 4: shapes[name] = {cs}; break;
+                        case 5: shapes[name] = {1, 1, cs, P}; break;
+                    }
                 }
-            }
-            model->reshape(shapes);
-            model = add_f32_output_conversion(model);
+                model->reshape(shapes);
+                model = add_f32_output_conversion(model);
 
-            ov::AnyMap npu_config = {
-                {"NPU_COMPILER_TYPE", "PREFER_PLUGIN"},
-                {ov::hint::performance_mode.name(), ov::hint::PerformanceMode::LATENCY},
-                {ov::hint::num_requests.name(), uint32_t(1)}
-            };
-            auto compiled = core_.compile_model(model, "NPU", npu_config);
-            attn_prefill_models_.push_back(compiled);
-            attn_prefill_requests_.push_back(compiled.create_infer_request());
+                ov::AnyMap npu_config = {
+                    {"NPU_COMPILER_TYPE", "PREFER_PLUGIN"},
+                    {ov::hint::performance_mode.name(), ov::hint::PerformanceMode::LATENCY},
+                    {ov::hint::num_requests.name(), uint32_t(1)}
+                };
+                auto compiled = core_.compile_model(model, "NPU", npu_config);
+                models.push_back(compiled);
+                requests.push_back(compiled.create_infer_request());
+            }
+            attn_prefill_models_[cs] = std::move(models);
+            attn_prefill_requests_[cs] = std::move(requests);
         }
-        log("  Attn prefill compilation: " + std::to_string(elapsed_ms(t0)) + " ms");
+        log("  Attn prefill compilation (" + std::to_string(chunk_sizes.size()) +
+            " sizes): " + std::to_string(elapsed_ms(t0)) + " ms");
     }
 
     init_kv_caches();
@@ -324,23 +341,26 @@ void Qwen35HybridModel::alloc_buffers() {
                                 {1, 1, 1, static_cast<size_t>(P)},
                                 attn_mask_buf_.data());
 
-    // Create tensor wrappers for prefill (S=chunk_size)
-    if (C > 1) {
-        sc_hidden_ = ov::Tensor(ov::element::f32,
-                                 {1, static_cast<size_t>(C), static_cast<size_t>(H)},
-                                 hidden_buf_.data());
-        sc_gdn_mask_ = ov::Tensor(ov::element::i64,
-                                    {1, static_cast<size_t>(C)},
-                                    gdn_mask_buf_.data());
-        sc_pos_ = ov::Tensor(ov::element::i64,
-                               {3, 1, static_cast<size_t>(C)},
-                               pos_buf_.data());
-        sc_cache_pos_ = ov::Tensor(ov::element::i64,
-                                     {static_cast<size_t>(C)},
-                                     cache_pos_buf_.data());
-        sc_attn_mask_ = ov::Tensor(ov::element::f32,
-                                     {1, 1, static_cast<size_t>(C), static_cast<size_t>(P)},
-                                     attn_mask_buf_.data());
+    // Create tensor wrappers for prefill — one set per chunk size (16, 8, 4, 2)
+    // All share the same underlying buffers (hidden_buf_, etc.) since only one
+    // chunk size is active at a time during prefill.
+    for (int cs = C; cs >= 2; cs /= 2) {
+        size_t S = static_cast<size_t>(cs);
+        sc_hidden_[cs] = ov::Tensor(ov::element::f32,
+                                     {1, S, static_cast<size_t>(H)},
+                                     hidden_buf_.data());
+        sc_gdn_mask_[cs] = ov::Tensor(ov::element::i64,
+                                        {1, S},
+                                        gdn_mask_buf_.data());
+        sc_pos_[cs] = ov::Tensor(ov::element::i64,
+                                   {3, 1, S},
+                                   pos_buf_.data());
+        sc_cache_pos_[cs] = ov::Tensor(ov::element::i64,
+                                         {S},
+                                         cache_pos_buf_.data());
+        sc_attn_mask_[cs] = ov::Tensor(ov::element::f32,
+                                         {1, 1, S, static_cast<size_t>(P)},
+                                         attn_mask_buf_.data());
     }
 }
 

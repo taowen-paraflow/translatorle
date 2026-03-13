@@ -35,6 +35,7 @@ from .export import (
     patched_recurrent_gated_delta_rule,
     qwen3_5_gated_delta_net_forward,
 )
+from .chunkwise_gdn import ChunkwiseRecurrentAttentionCell
 from .ov_ops import convert_recurrent_attention_cell, convert_kv_cache_scatter_update
 
 logger = logging.getLogger(__name__)
@@ -317,6 +318,23 @@ def _patch_gdn_layers(layers):
         gdn.recurrent_attention_cell = RecurrentAttentionCell()
 
 
+def _patch_gdn_layers_chunkwise(layers):
+    """Patch GDN layers with ChunkwiseRecurrentAttentionCell for parallel prefill.
+
+    Uses WY representation instead of sequential Loop. All ops (MatMul, tril,
+    cumsum, exp) are standard OV opset — no Loop node, no ModuleExtension needed.
+    """
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
+
+    for layer in layers:
+        if not (hasattr(layer, "linear_attn") and isinstance(layer.linear_attn, Qwen3_5GatedDeltaNet)):
+            continue
+        gdn = layer.linear_attn
+        gdn.forward = types.MethodType(qwen3_5_gated_delta_net_forward, gdn)
+        gdn.recurrent_gated_delta_rule = patched_recurrent_gated_delta_rule
+        gdn.recurrent_attention_cell = ChunkwiseRecurrentAttentionCell()
+
+
 # ---------------------------------------------------------------------------
 # Export functions
 # ---------------------------------------------------------------------------
@@ -446,6 +464,77 @@ def export_gdn_block(layers, layer_indices, group_idx, text_cfg, output_dir):
 
     path = Path(output_dir) / f"gdn_block_{group_idx}.xml"
     ov.save_model(ov_model, str(path), compress_to_fp16=True)
+    logger.info("  Saved %s (%d ops)", path, len(list(ov_model.get_ops())))
+
+
+def export_gdn_prefill_block(layers, layer_indices, group_idx, text_cfg, output_dir):
+    """Export a GDN prefill block (3 layers) using chunkwise parallel algorithm.
+
+    Unlike the Loop-based decode block, this uses parallel MatMul operations
+    (WY representation). No Loop node — all operations are standard opset ops.
+    The IR has explicit state I/O (not stateful).
+    No ModuleExtension needed — OV traces ChunkwiseRecurrentAttentionCell directly.
+    """
+    logger.info("Exporting GDN prefill block %d (layers %s, chunkwise) ...", group_idx, layer_indices)
+
+    wrapper = GDNBlockWrapper(nn.ModuleList(layers), layer_indices)
+    _patch_gdn_layers_chunkwise(wrapper.layers)
+    wrapper.eval()
+
+    # Dimensions
+    hidden_size = text_cfg.hidden_size
+    conv_dim = (
+        text_cfg.linear_num_key_heads * text_cfg.linear_key_head_dim * 2
+        + text_cfg.linear_num_value_heads * text_cfg.linear_value_head_dim
+    )
+    conv_kernel = text_cfg.linear_conv_kernel_dim
+    num_v_heads = text_cfg.linear_num_value_heads
+    k_head_dim = text_cfg.linear_key_head_dim
+    v_head_dim = text_cfg.linear_value_head_dim
+
+    # B=2, S=2 for tracing (needs S>=2 for cumsum/matmul)
+    B, S = 2, 2
+    dummy = {
+        "hidden_states": torch.zeros(B, S, hidden_size),
+        "attention_mask": torch.ones(B, S, dtype=torch.int64),
+        "conv_state_0": torch.zeros(B, conv_dim, conv_kernel),
+        "recurrent_state_0": torch.zeros(B, num_v_heads, k_head_dim, v_head_dim),
+        "conv_state_1": torch.zeros(B, conv_dim, conv_kernel),
+        "recurrent_state_1": torch.zeros(B, num_v_heads, k_head_dim, v_head_dim),
+        "conv_state_2": torch.zeros(B, conv_dim, conv_kernel),
+        "recurrent_state_2": torch.zeros(B, num_v_heads, k_head_dim, v_head_dim),
+    }
+
+    # No extensions needed — ChunkwiseRecurrentAttentionCell traces directly
+    with torch.no_grad():
+        ov_model = ov.convert_model(wrapper, example_input=dummy)
+
+    # Verify no Loop nodes
+    loops = [op for op in ov_model.get_ops() if op.get_type_name() in ("Loop", "TensorIterator")]
+    matmuls = sum(1 for op in ov_model.get_ops() if op.get_type_name() == "MatMul")
+    if loops:
+        logger.warning("  WARNING: Found %d Loop ops in chunkwise prefill block %d!", len(loops), group_idx)
+    else:
+        logger.info("  No Loop nodes (chunkwise), %d MatMul ops", matmuls)
+
+    # Name I/O (same names as decode block for compatibility)
+    in_names = [
+        "in_hidden", "in_mask",
+        "in_conv0", "in_rec0",
+        "in_conv1", "in_rec1",
+        "in_conv2", "in_rec2",
+    ]
+    out_names = [
+        "out_hidden",
+        "out_conv0", "out_rec0",
+        "out_conv1", "out_rec1",
+        "out_conv2", "out_rec2",
+    ]
+    _make_dynamic_shapes_gdn(ov_model, in_names, out_names)
+
+    path = Path(output_dir) / f"gdn_prefill_block_{group_idx}.xml"
+    # Keep FP32: Neumann series (7 matrix squarings) needs FP32 precision.
+    ov.save_model(ov_model, str(path), compress_to_fp16=False)
     logger.info("  Saved %s (%d ops)", path, len(list(ov_model.get_ops())))
 
 
@@ -589,9 +678,10 @@ def export_hybrid_subgraphs(model_dir: str, output_dir: str):
             gdn_layers.append(layer)
             gdn_indices.append(i)
         else:
-            # Export accumulated GDN block
+            # Export accumulated GDN block (decode Loop + prefill chunkwise)
             if gdn_layers:
                 export_gdn_block(gdn_layers, gdn_indices, group_idx, text_cfg, output_dir)
+                export_gdn_prefill_block(gdn_layers, gdn_indices, group_idx, text_cfg, output_dir)
                 gdn_layers = []
                 gdn_indices = []
 
@@ -602,6 +692,7 @@ def export_hybrid_subgraphs(model_dir: str, output_dir: str):
     # Trailing GDN layers (shouldn't happen for 0.8B but handle generically)
     if gdn_layers:
         export_gdn_block(gdn_layers, gdn_indices, group_idx, text_cfg, output_dir)
+        export_gdn_prefill_block(gdn_layers, gdn_indices, group_idx, text_cfg, output_dir)
 
     # Export head
     export_head(model.model.norm, model.lm_head, text_cfg, output_dir)
@@ -619,10 +710,11 @@ def export_hybrid_subgraphs(model_dir: str, output_dir: str):
 
     # Summary
     logger.info("=== Export complete: %s ===", output_path)
-    logger.info("  GDN blocks:  %d", group_idx)
+    logger.info("  GDN blocks (decode):  %d", group_idx)
+    logger.info("  GDN blocks (prefill): %d (chunkwise, no Loop)", group_idx)
     logger.info("  Attn blocks: %d", group_idx)
     logger.info("  Head block:  1")
-    logger.info("  Total:       %d subgraphs", group_idx * 2 + 1)
+    logger.info("  Total:       %d subgraphs", group_idx * 3 + 1)
 
 
 # ---------------------------------------------------------------------------
