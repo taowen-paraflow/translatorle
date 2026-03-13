@@ -15,6 +15,7 @@ set(SOURCES
     src/main.cpp
     src/hybrid_model.cpp
     src/hybrid_forward.cpp
+    src/hybrid_mtp.cpp
     src/npy_reader.cpp
     src/tokenizer.cpp
 )

@@ -184,3 +184,76 @@ std::vector<float> load_npy_fp16_as_fp32(const std::string& path,
 
     return fp32_out;
 }
+
+std::vector<float> load_npy_fp32(const std::string& path,
+                                 std::vector<size_t>& shape_out) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open file: " + path);
+    }
+
+    char magic[6];
+    file.read(magic, 6);
+    if (!file || magic[0] != '\x93' || std::strncmp(magic + 1, "NUMPY", 5) != 0) {
+        throw std::runtime_error("Not a valid .npy file: " + path);
+    }
+
+    uint8_t major = 0, minor = 0;
+    file.read(reinterpret_cast<char*>(&major), 1);
+    file.read(reinterpret_cast<char*>(&minor), 1);
+    if (!file) {
+        throw std::runtime_error("Failed to read npy version: " + path);
+    }
+
+    uint32_t header_len = 0;
+    if (major == 1) {
+        char buf[2];
+        file.read(buf, 2);
+        if (!file) throw std::runtime_error("Failed to read v1 header length: " + path);
+        header_len = read_le16(buf);
+    } else if (major == 2) {
+        char buf[4];
+        file.read(buf, 4);
+        if (!file) throw std::runtime_error("Failed to read v2 header length: " + path);
+        header_len = read_le32(buf);
+    } else {
+        throw std::runtime_error("Unsupported npy version " + std::to_string(major) +
+                                 "." + std::to_string(minor) + ": " + path);
+    }
+
+    std::string header(header_len, '\0');
+    file.read(&header[0], header_len);
+    if (!file) {
+        throw std::runtime_error("Failed to read npy header: " + path);
+    }
+
+    std::string descr = extract_string_value(header, "descr");
+    if (descr != "<f4") {
+        throw std::runtime_error("Unsupported dtype '" + descr +
+                                 "', expected '<f4' (float32): " + path);
+    }
+
+    if (extract_fortran_order(header)) {
+        throw std::runtime_error("Fortran order not supported: " + path);
+    }
+
+    shape_out = extract_shape(header);
+
+    size_t num_elements = 1;
+    for (size_t dim : shape_out) {
+        num_elements *= dim;
+    }
+    if (num_elements == 0) {
+        return {};
+    }
+
+    std::vector<float> data(num_elements);
+    size_t data_bytes = num_elements * sizeof(float);
+    file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data_bytes));
+    if (!file) {
+        throw std::runtime_error("Failed to read " + std::to_string(data_bytes) +
+                                 " bytes of data from: " + path);
+    }
+
+    return data;
+}

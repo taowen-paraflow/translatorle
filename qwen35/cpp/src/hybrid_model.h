@@ -46,7 +46,8 @@ public:
                        int prefill_chunk_size = 16,
                        const std::string& tokenizers_lib = "",
                        bool use_latency_hint = false,
-                       bool no_gdn_prefill = false);
+                       bool no_gdn_prefill = false,
+                       int mtp_steps = 0);
 
     ~Qwen35HybridModel();
 
@@ -60,6 +61,19 @@ private:
     void load_attn_blocks(const std::string& model_dir);
     void load_head(const std::string& model_dir);
     void load_embeddings(const std::string& model_dir);
+    void load_mtp_block(const std::string& model_dir);
+    int run_mtp_draft(int token_id);
+    int mtp_cpu_argmax(const float* logits);
+    int mtp_cpu_lm_head_argmax(const float* hidden);
+    void save_gdn_snapshot();
+    void restore_gdn_snapshot();
+    void reset_mtp_kv();
+    void transfer_decode_to_prefill();
+    /// Batch-verify draft tokens: GDN prefill + chunked attention in one pass.
+    /// Returns (accepted_count, logits_ptr). Sets model state correctly.
+    std::pair<int, const float*> batch_verify_draft(
+        const int64_t* verify_tokens, int verify_len,
+        const int64_t* draft_tokens, int draft_len);
 
     void init_gdn_states();
     void init_gdn_prefill_states();
@@ -94,6 +108,46 @@ private:
     int past_length_;
     int kv_total_;  // num_kv_heads * attn_past_seq * head_dim (cached for memcpy)
     bool use_latency_hint_;
+    bool no_gdn_prefill_;
+
+    // MTP speculative decoding
+    int mtp_steps_ = 0;  // 0 = disabled
+    ov::CompiledModel mtp_model_;
+    ov::InferRequest mtp_request_;
+    bool has_mtp_ = false;
+
+    // MTP KV cache — explicit I/O (not stateful), 2 KV heads, head_dim=256, max_cache=256
+    ov::Tensor mtp_kv_key_;    // [1, 2, 256, 256]
+    ov::Tensor mtp_kv_value_;  // [1, 2, 256, 256]
+    int mtp_past_length_ = 0;
+    int mtp_kv_total_ = 0;    // num_kv_heads * max_cache * head_dim
+
+    // MTP pre-allocated buffers
+    std::vector<float> mtp_hidden_buf_;     // [hidden_size] MTP output
+    std::vector<float> mtp_saved_hidden_;   // [hidden_size] saved from main model decode
+    ov::Tensor mtp_hidden_tensor_;   // [1, 1, hidden_size] wrapping mtp_hidden_buf_
+    ov::Tensor mtp_embeds_tensor_;   // [1, 1, hidden_size]
+    ov::Tensor mtp_pos_tensor_;      // [3, 1, 1]
+    ov::Tensor mtp_cache_pos_tensor_; // [1]
+    ov::Tensor mtp_mask_tensor_;     // [1, 1, 1, 256]
+    std::vector<float> mtp_embeds_buf_;     // [hidden_size]
+    std::vector<int64_t> mtp_pos_buf_;      // [3]
+    std::vector<int64_t> mtp_cache_pos_buf_; // [1]
+    std::vector<float> mtp_mask_buf_;       // [256]
+    std::vector<float> mtp_norm_correction_; // [hidden_size] = model.norm.w / mtp.norm.w
+
+    // GDN state snapshots for speculative decode rollback
+    struct GdnSnapshot {
+        std::vector<ov::Tensor> states;  // all states for one GDN block
+    };
+    std::vector<GdnSnapshot> gdn_snapshots_;
+
+    // Speculative decode statistics
+    int spec_accepted_ = 0;
+    int spec_rejected_ = 0;
+    double spec_draft_ms_ = 0;
+    double spec_verify_ms_ = 0;
+    double spec_rollback_ms_ = 0;
 
     // Decode timing accumulators (filled during generate, printed at end)
     std::vector<double> decode_gdn_ms_;   // per-block GDN time
@@ -112,6 +166,7 @@ private:
     std::vector<ov::CompiledModel> gdn_prefill_models_;
     std::vector<ov::InferRequest> gdn_prefill_requests_;
     bool has_gdn_prefill_ = false;
+    bool has_gdn_s1_ = false;  // S1 no-Loop GDN decode blocks loaded
 
     // Explicit GDN state buffers for prefill (conv + rec per layer per block)
     // gdn_prefill_conv_states_[block][layer] — [1, conv_dim, conv_kernel]

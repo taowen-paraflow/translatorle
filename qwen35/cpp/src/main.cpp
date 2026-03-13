@@ -14,6 +14,7 @@ static void print_usage(const char* prog) {
               << "  --tokenizers-lib PATH   Path to openvino_tokenizers shared library\n"
               << "  --latency               Use PERFORMANCE_HINT: LATENCY (default: off)\n"
               << "  --no-gdn-prefill        Skip chunkwise GDN prefill (reduces GPU memory)\n"
+              << "  --mtp-steps N           MTP speculative decode draft steps (default: 0 = disabled)\n"
               << "  --help                  Show this help message\n";
 }
 
@@ -26,6 +27,7 @@ int main(int argc, char* argv[]) {
     std::string tokenizers_lib;
     bool use_latency_hint = false;
     bool no_gdn_prefill = false;
+    int mtp_steps = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -48,6 +50,8 @@ int main(int argc, char* argv[]) {
             use_latency_hint = true;
         } else if (arg == "--no-gdn-prefill") {
             no_gdn_prefill = true;
+        } else if (arg == "--mtp-steps" && i + 1 < argc) {
+            mtp_steps = std::stoi(argv[++i]);
         } else {
             std::cerr << "Unknown argument: " << arg << "\n";
             print_usage(argv[0]);
@@ -65,12 +69,13 @@ int main(int argc, char* argv[]) {
         std::cout << "Tokenizers lib:      " << tokenizers_lib << "\n";
     }
     std::cout << "Latency hint:        " << (use_latency_hint ? "ON" : "OFF") << "\n";
+    std::cout << "MTP steps:           " << mtp_steps << (mtp_steps > 0 ? " (speculative)" : " (disabled)") << "\n";
     std::cout << "===============================================\n\n";
 
     try {
         auto t_start = std::chrono::steady_clock::now();
 
-        Qwen35HybridModel model(model_dir, attn_past_seq, prefill_chunk_size, tokenizers_lib, use_latency_hint, no_gdn_prefill);
+        Qwen35HybridModel model(model_dir, attn_past_seq, prefill_chunk_size, tokenizers_lib, use_latency_hint, no_gdn_prefill, mtp_steps);
 
         auto t_loaded = std::chrono::steady_clock::now();
         double load_sec = std::chrono::duration<double>(t_loaded - t_start).count();

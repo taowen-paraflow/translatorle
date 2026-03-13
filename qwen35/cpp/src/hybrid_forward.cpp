@@ -17,6 +17,14 @@
 void Qwen35HybridModel::run_gdn_block(int block_idx, int seq_len) {
     auto& req = gdn_requests_[block_idx];
 
+    if (has_gdn_s1_) {
+        // S1 explicit I/O: all tensors pre-bound in bind_decode_tensors().
+        // State I/O uses same host buffers — GPU copies in/out automatically.
+        req.infer();
+        return;
+    }
+
+    // Stateful path (Loop-based blocks)
     bool is_decode = (seq_len == 1);
     auto& hidden = is_decode ? s1_hidden_ : sc_hidden_.at(seq_len);
     req.set_input_tensor(0, hidden);
@@ -416,8 +424,9 @@ std::string Qwen35HybridModel::generate(const std::string& prompt, int max_new_t
         std::to_string(prompt_len / (prefill_ms / 1000.0)) + " tok/s, chunk=" +
         std::to_string(chunk_size) + ", layer-major)");
 
-    // --- Greedy decode ---
+    // --- Greedy decode (with optional MTP speculative decoding) ---
     int V = cfg_.vocab_size;
+    int H = cfg_.hidden_size;
     int next_id = static_cast<int>(
         std::max_element(logits, logits + V) - logits);
 
@@ -426,16 +435,151 @@ std::string Qwen35HybridModel::generate(const std::string& prompt, int max_new_t
 
     std::set<int> stop_ids = {151645, 151643, 248044};
 
+    // MTP speculative decode state
+    const int MAX_DRAFT = 8;  // max draft tokens per round
+    int eff_mtp_steps = has_mtp_ ? std::min(mtp_steps_, MAX_DRAFT) : 0;
+
     auto t_decode = std::chrono::steady_clock::now();
-    for (int step = 0; step < max_new_tokens - 1; ++step) {
+
+    for (int step = 0; step < max_new_tokens - 1; ) {
         if (stop_ids.count(next_id)) break;
 
-        int64_t tid = static_cast<int64_t>(next_id);
-        logits = forward(&tid, 1, /*run_head=*/true);
-        next_id = static_cast<int>(
+        if (eff_mtp_steps <= 0) {
+            // --- Normal decode (no MTP) ---
+            int64_t tid = static_cast<int64_t>(next_id);
+            logits = forward(&tid, 1, /*run_head=*/true);
+            next_id = static_cast<int>(
+                std::max_element(logits, logits + V) - logits);
+            generated.push_back(next_id);
+            step++;
+            continue;
+        }
+
+        // === MTP Speculative Decode ===
+        //
+        // Flow for each round:
+        //   1. Main model decode: process next_id -> logits -> main_next
+        //      (hidden_buf_ now has the hidden state, GDN/KV states updated)
+        //   2. MTP draft: use hidden_buf_ to predict draft tokens D[0..N-1]
+        //   3. Verify: check if main_next == D[0].
+        //      If yes, feed D[0] into main model -> check D[1], etc.
+        //      If no, reject all drafts.
+        //   4. Output: main_next + all accepted drafts + bonus token
+        //
+        // Key insight: the main model decode in step 1 gives us main_next
+        // "for free" — we can compare it with D[0] without extra compute.
+
+        // Step 1: Main model decode
+        {
+            int64_t tid = static_cast<int64_t>(next_id);
+            logits = forward(&tid, 1, /*run_head=*/true);
+        }
+        int main_next = static_cast<int>(
             std::max_element(logits, logits + V) - logits);
-        generated.push_back(next_id);
+
+        // Step 2: MTP draft
+        // Note: MTP KV cache accumulates across decode steps (NOT reset per round).
+        // For mtp_steps=1, each MTP call uses the main model's actual prediction,
+        // so the accumulated context is always based on correct tokens. This matches
+        // the Python reference implementation and gives ~56% acceptance (vs ~4% if
+        // reset every round).
+        auto t_draft = std::chrono::steady_clock::now();
+        std::memcpy(mtp_saved_hidden_.data(), hidden_buf_.data(), H * sizeof(float));
+        std::memcpy(mtp_hidden_buf_.data(), mtp_saved_hidden_.data(), H * sizeof(float));
+
+        int64_t draft_tokens[MAX_DRAFT];
+        int draft_len = 0;
+
+        for (int d = 0; d < eff_mtp_steps; d++) {
+            int input_token = (d == 0) ? main_next
+                                       : static_cast<int>(draft_tokens[d - 1]);
+            int draft_id = run_mtp_draft(input_token);
+            draft_tokens[d] = static_cast<int64_t>(draft_id);
+            draft_len++;
+            if (stop_ids.count(draft_id)) break;
+        }
+        spec_draft_ms_ += elapsed_ms(t_draft);
+
+        // Step 3: Verify draft tokens against main model
+        //
+        // Two paths:
+        //   A) Batch verify (requires GDN prefill blocks): process all verify
+        //      tokens in one pass through GDN prefill + chunked attention.
+        //      Much cheaper than sequential S=1 forwards (~30ms vs ~95ms for S=2).
+        //   B) Sequential verify (fallback): feed tokens one-by-one.
+        //      No speedup over normal decode, but correct.
+        auto t_verify = std::chrono::steady_clock::now();
+
+        int accepted = 0;
+
+        // Build verify sequence: [main_next, D[0], ..., D[draft_len-1]]
+        int64_t verify_tokens[MAX_DRAFT + 1];
+        verify_tokens[0] = static_cast<int64_t>(main_next);
+        for (int d = 0; d < draft_len; d++)
+            verify_tokens[d + 1] = draft_tokens[d];
+        int verify_len = 1 + draft_len;
+
+        // Batch verify: process all verify tokens in one pass through GDN prefill
+        // + chunked NPU attention. Requires S1 explicit I/O GDN decode blocks
+        // (has_gdn_s1_) so states are in host memory and shared with prefill.
+        if (has_gdn_s1_ && has_gdn_prefill_) {
+            // --- Batch verify (disabled) ---
+            auto [acc, bonus_logits] = batch_verify_draft(
+                verify_tokens, verify_len, draft_tokens, draft_len);
+            accepted = acc;
+            logits = bonus_logits;
+        } else {
+            // --- Sequential verify (fallback) ---
+            {
+                int64_t tid = static_cast<int64_t>(main_next);
+                logits = forward(&tid, 1, /*run_head=*/true);
+            }
+            for (int d = 0; d < draft_len; d++) {
+                int verify_pred = static_cast<int>(
+                    std::max_element(logits, logits + V) - logits);
+                if (verify_pred == static_cast<int>(draft_tokens[d])) {
+                    accepted++;
+                    int64_t tid = draft_tokens[d];
+                    logits = forward(&tid, 1, /*run_head=*/true);
+                } else {
+                    break;
+                }
+            }
+        }
+        spec_verify_ms_ += elapsed_ms(t_verify);
+
+        // Step 4: Output tokens
+        // main_next is always output (main model confirmed it)
+        generated.push_back(main_next);
+        step++;
+        bool hit_stop = stop_ids.count(main_next) > 0;
+
+        // Output accepted draft tokens
+        if (!hit_stop) {
+            for (int d = 0; d < accepted; d++) {
+                generated.push_back(draft_tokens[d]);
+                step++;
+                if (stop_ids.count(static_cast<int>(draft_tokens[d]))) {
+                    hit_stop = true;
+                    break;
+                }
+            }
+        }
+
+        // Bonus token: main model's next prediction after last verified token
+        if (!hit_stop) {
+            next_id = static_cast<int>(
+                std::max_element(logits, logits + V) - logits);
+            generated.push_back(next_id);
+            step++;
+        } else {
+            next_id = static_cast<int>(generated.back());
+        }
+
+        spec_accepted_ += accepted;
+        spec_rejected_ += (draft_len - accepted);
     }
+
     double decode_ms = elapsed_ms(t_decode);
     int num_decoded = static_cast<int>(generated.size());
 
@@ -450,29 +594,44 @@ std::string Qwen35HybridModel::generate(const std::string& prompt, int max_new_t
             gdn_total += decode_gdn_ms_[i];
             attn_total += decode_attn_ms_[i];
         }
-        double per_tok = decode_ms / decode_steps_;
-        log("=== Decode Timing Breakdown (avg per token: " +
-            std::to_string(per_tok).substr(0, std::to_string(per_tok).find('.') + 2) + "ms) ===");
-        for (int i = 0; i < cfg_.num_blocks; ++i) {
-            double gdn_avg = decode_gdn_ms_[i] / decode_steps_;
-            double attn_avg = decode_attn_ms_[i] / decode_steps_;
-            log("  Block " + std::to_string(i) + ": GDN=" +
+        if (decode_steps_ > 0) {
+            double per_tok = decode_ms / decode_steps_;
+            log("=== Decode Timing Breakdown (avg per token: " +
+                std::to_string(per_tok).substr(0, std::to_string(per_tok).find('.') + 2) + "ms) ===");
+            for (int i = 0; i < cfg_.num_blocks; ++i) {
+                double gdn_avg = decode_gdn_ms_[i] / decode_steps_;
+                double attn_avg = decode_attn_ms_[i] / decode_steps_;
+                log("  Block " + std::to_string(i) + ": GDN=" +
+                    std::to_string(gdn_avg).substr(0, std::to_string(gdn_avg).find('.') + 2) +
+                    "ms  Attn=" +
+                    std::to_string(attn_avg).substr(0, std::to_string(attn_avg).find('.') + 2) + "ms");
+            }
+            double gdn_avg = gdn_total / decode_steps_;
+            double attn_avg = attn_total / decode_steps_;
+            double head_avg = decode_head_ms_ / decode_steps_;
+            log("  Total: GDN=" +
                 std::to_string(gdn_avg).substr(0, std::to_string(gdn_avg).find('.') + 2) +
-                "ms  Attn=" +
-                std::to_string(attn_avg).substr(0, std::to_string(attn_avg).find('.') + 2) + "ms");
+                "ms (" + std::to_string(gdn_total / decode_ms * 100).substr(0, 4) +
+                "%)  Attn=" +
+                std::to_string(attn_avg).substr(0, std::to_string(attn_avg).find('.') + 2) +
+                "ms (" + std::to_string(attn_total / decode_ms * 100).substr(0, 4) +
+                "%)  Head=" +
+                std::to_string(head_avg).substr(0, std::to_string(head_avg).find('.') + 2) +
+                "ms (" + std::to_string(decode_head_ms_ / decode_ms * 100).substr(0, 4) + "%)");
         }
-        double gdn_avg = gdn_total / decode_steps_;
-        double attn_avg = attn_total / decode_steps_;
-        double head_avg = decode_head_ms_ / decode_steps_;
-        log("  Total: GDN=" +
-            std::to_string(gdn_avg).substr(0, std::to_string(gdn_avg).find('.') + 2) +
-            "ms (" + std::to_string(gdn_total / decode_ms * 100).substr(0, 4) +
-            "%)  Attn=" +
-            std::to_string(attn_avg).substr(0, std::to_string(attn_avg).find('.') + 2) +
-            "ms (" + std::to_string(attn_total / decode_ms * 100).substr(0, 4) +
-            "%)  Head=" +
-            std::to_string(head_avg).substr(0, std::to_string(head_avg).find('.') + 2) +
-            "ms (" + std::to_string(decode_head_ms_ / decode_ms * 100).substr(0, 4) + "%)");
+
+        // MTP speculative decode statistics
+        if (has_mtp_ && eff_mtp_steps > 0) {
+            int total_drafted = spec_accepted_ + spec_rejected_;
+            double accept_rate = total_drafted > 0
+                ? (100.0 * spec_accepted_ / total_drafted) : 0.0;
+            log("=== MTP Speculative Decode Stats ===");
+            log("  Accepted: " + std::to_string(spec_accepted_) +
+                "  Rejected: " + std::to_string(spec_rejected_) +
+                "  Rate: " + std::to_string(accept_rate).substr(0, 5) + "%");
+            log("  Draft time: " + std::to_string(spec_draft_ms_).substr(0, std::to_string(spec_draft_ms_).find('.') + 2) +
+                "ms  Verify time: " + std::to_string(spec_verify_ms_).substr(0, std::to_string(spec_verify_ms_).find('.') + 2) + "ms");
+        }
     }
 
     if (!generated.empty() && stop_ids.count(static_cast<int>(generated.back()))) {

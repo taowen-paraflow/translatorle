@@ -189,6 +189,9 @@ def main():
         # Also quantize chunkwise GDN prefill blocks (same weights, different graph)
         if (src_dir / f"gdn_prefill_block_{i}.xml").exists():
             subgraphs.append((f"gdn_prefill_block_{i}", args.gdn_mode, "GDN"))
+        # Also quantize S1 (no-Loop) GDN decode blocks
+        if (src_dir / f"gdn_s1_block_{i}.xml").exists():
+            subgraphs.append((f"gdn_s1_block_{i}", args.gdn_mode, "GDN"))
     for i in range(NUM_ATTN_BLOCKS):
         subgraphs.append((f"attn_block_{i}", args.attn_mode, "Attn"))
     subgraphs.append(("head", args.head_mode, "Head"))

@@ -11,4 +11,10 @@
 std::vector<float> load_npy_fp16_as_fp32(const std::string& path,
                                          std::vector<size_t>& shape_out);
 
+// Load a .npy file containing FP32 ('<f4') data.
+// Populates shape_out with the array dimensions (e.g., {1024}).
+// Throws std::runtime_error on any format or I/O error.
+std::vector<float> load_npy_fp32(const std::string& path,
+                                 std::vector<size_t>& shape_out);
+
 #endif // NPY_READER_H
