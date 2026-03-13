@@ -15,7 +15,8 @@ param(
 
 $root = "C:\Apps\translatorle"
 $exe = "$root\qwen35\cpp\build\Release\qwen35_infer.exe"
-$modelDir = "$root\models\qwen35\Qwen3.5-0.8B-hybrid"
+# Use quantized model by default (INT4 attn + INT8 GDN + INT4 head = 4.1GB, ~20% faster)
+$modelDir = "$root\models\qwen35\Qwen3.5-0.8B-hybrid-attn-int4sym-gdn-int8sym-head-int4sym"
 $tokLib = "$root\.venv\Lib\site-packages\openvino_tokenizers\lib\openvino_tokenizers.dll"
 
 # Add OpenVINO libs to PATH

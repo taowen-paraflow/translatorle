@@ -22,15 +22,17 @@ struct ModelConfig {
     int num_blocks;      // number of GDN+Attn block pairs (detected from files)
 };
 
-/// Hybrid GPU+NPU inference for Qwen3.5 using 13 subgraph IRs.
-/// GDN blocks run on GPU (stateful), Attention blocks on NPU (explicit I/O
-/// with fixed-size ScatterUpdate-3 KV cache), Head on GPU.
+/// Hybrid GPU+NPU inference for Qwen3.5 using up to 19 subgraph IRs.
+/// GDN decode blocks run on GPU (stateful Loop), GDN prefill blocks run on
+/// GPU (explicit I/O, chunkwise parallel MatMul, no Loop), Attention blocks
+/// on NPU (explicit I/O with fixed-size ScatterUpdate-3 KV cache), Head on GPU.
 ///
 /// Performance optimizations over naive approach:
 ///   - CACHE_DIR for NPU/GPU model caching (60s→<1s startup)
 ///   - Fixed-size KV cache (no per-step padding/compacting)
 ///   - Pre-allocated tensor wrappers (zero allocation in hot loop)
 ///   - Chunked prefill (S=16 NPU models, skip Head for intermediate chunks)
+///   - Chunkwise parallel GDN prefill (no Loop, ~2x prefill speedup)
 ///   - Return logits pointer (no 1MB copy per decode step)
 class Qwen35HybridModel {
 public:
@@ -38,10 +40,13 @@ public:
     /// @param attn_past_seq       Static KV cache size for NPU attention (default 256)
     /// @param prefill_chunk_size  Tokens per prefill chunk (default 16, 1=token-by-token)
     /// @param tokenizers_lib      Path to openvino_tokenizers shared library (.dll/.so)
+    /// @param use_latency_hint    Whether to use PERFORMANCE_HINT: LATENCY (default false)
     Qwen35HybridModel(const std::string& model_dir,
                        int attn_past_seq = 256,
                        int prefill_chunk_size = 16,
-                       const std::string& tokenizers_lib = "");
+                       const std::string& tokenizers_lib = "",
+                       bool use_latency_hint = false,
+                       bool no_gdn_prefill = false);
 
     ~Qwen35HybridModel();
 
@@ -51,14 +56,19 @@ public:
 private:
     ModelConfig load_config(const std::string& model_dir);
     void load_gdn_blocks(const std::string& model_dir);
+    void load_gdn_prefill_blocks(const std::string& model_dir);
     void load_attn_blocks(const std::string& model_dir);
     void load_head(const std::string& model_dir);
     void load_embeddings(const std::string& model_dir);
 
     void init_gdn_states();
+    void init_gdn_prefill_states();
     void init_kv_caches();
     void alloc_buffers();
     void reset();
+
+    void run_gdn_prefill_block(int block_idx, ov::Tensor& hidden_tensor, ov::Tensor& mask_tensor);
+    void transfer_prefill_states_to_decode();
 
     /// Run one forward pass. Returns pointer to last token's logits (vocab_size floats).
     /// Pointer valid until next forward() call. If run_head=false, returns nullptr.
@@ -75,12 +85,21 @@ private:
 
     static std::shared_ptr<ov::Model> add_f32_output_conversion(std::shared_ptr<ov::Model> model);
 
+    void bind_decode_tensors();
+
     // Config
     ModelConfig cfg_;
     int attn_past_seq_;
     int prefill_chunk_size_;
     int past_length_;
     int kv_total_;  // num_kv_heads * attn_past_seq * head_dim (cached for memcpy)
+    bool use_latency_hint_;
+
+    // Decode timing accumulators (filled during generate, printed at end)
+    std::vector<double> decode_gdn_ms_;   // per-block GDN time
+    std::vector<double> decode_attn_ms_;  // per-block Attn time
+    double decode_head_ms_ = 0;
+    int decode_steps_ = 0;
 
     // OpenVINO
     ov::Core core_;
@@ -88,6 +107,17 @@ private:
     // GDN blocks — GPU, stateful (conv/recurrent state persists in GPU memory)
     std::vector<ov::CompiledModel> gdn_models_;
     std::vector<ov::InferRequest> gdn_requests_;
+
+    // GDN prefill blocks — GPU, explicit I/O (chunkwise parallel, no Loop)
+    std::vector<ov::CompiledModel> gdn_prefill_models_;
+    std::vector<ov::InferRequest> gdn_prefill_requests_;
+    bool has_gdn_prefill_ = false;
+
+    // Explicit GDN state buffers for prefill (conv + rec per layer per block)
+    // gdn_prefill_conv_states_[block][layer] — [1, conv_dim, conv_kernel]
+    // gdn_prefill_rec_states_[block][layer]  — [1, num_v_heads, k_head_dim, v_head_dim]
+    std::vector<std::vector<ov::Tensor>> gdn_prefill_conv_states_;
+    std::vector<std::vector<ov::Tensor>> gdn_prefill_rec_states_;
 
     // Attention blocks — NPU, explicit I/O, S=1 (decode)
     std::vector<ov::CompiledModel> attn_models_;

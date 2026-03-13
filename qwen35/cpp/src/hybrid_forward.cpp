@@ -29,6 +29,43 @@ void Qwen35HybridModel::run_gdn_block(int block_idx, int seq_len) {
 }
 
 // ---------------------------------------------------------------------------
+// GDN prefill block inference (GPU, explicit I/O, chunkwise parallel)
+// ---------------------------------------------------------------------------
+
+void Qwen35HybridModel::run_gdn_prefill_block(
+    int block_idx, ov::Tensor& hidden_tensor, ov::Tensor& mask_tensor)
+{
+    auto& req = gdn_prefill_requests_[block_idx];
+
+    // Input 0: hidden [1, S, H], Input 1: mask [1, S]
+    req.set_input_tensor(0, hidden_tensor);
+    req.set_input_tensor(1, mask_tensor);
+
+    // Inputs 2-7: conv0, rec0, conv1, rec1, conv2, rec2
+    for (int j = 0; j < 3; ++j) {
+        req.set_input_tensor(2 + j * 2, gdn_prefill_conv_states_[block_idx][j]);
+        req.set_input_tensor(3 + j * 2, gdn_prefill_rec_states_[block_idx][j]);
+    }
+
+    // Output 0: hidden (set to same tensor for zero-copy on GPU)
+    req.set_output_tensor(0, hidden_tensor);
+
+    req.infer();
+
+    // Copy output states back (outputs 1-6: conv0, rec0, conv1, rec1, conv2, rec2)
+    for (int j = 0; j < 3; ++j) {
+        auto out_conv = req.get_output_tensor(1 + j * 2);
+        auto out_rec = req.get_output_tensor(2 + j * 2);
+        std::memcpy(gdn_prefill_conv_states_[block_idx][j].data<float>(),
+                    out_conv.data<const float>(),
+                    out_conv.get_byte_size());
+        std::memcpy(gdn_prefill_rec_states_[block_idx][j].data<float>(),
+                    out_rec.data<const float>(),
+                    out_rec.get_byte_size());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Attention block inference (NPU, explicit I/O, ScatterUpdate-3 fixed KV)
 // ---------------------------------------------------------------------------
 
@@ -106,6 +143,7 @@ const float* Qwen35HybridModel::forward(
     const int64_t* token_ids, int seq_len, bool run_head)
 {
     int H = cfg_.hidden_size;
+    bool is_decode = (seq_len == 1);
 
     // Embedding lookup into hidden_buf_ (CPU, ~0.02ms)
     for (int i = 0; i < seq_len; ++i) {
@@ -114,10 +152,49 @@ const float* Qwen35HybridModel::forward(
                     H * sizeof(float));
     }
 
-    // Auto-detect prefill mode — any compiled chunk size triggers prefill
+    if (is_decode) {
+        // --- Decode fast path: tensors pre-bound in bind_decode_tensors() ---
+        // Only need to update position_ids, cache_position, and attn_mask content.
+        // Hidden content updated by embedding lookup above (same buffer).
+        for (int c = 0; c < 3; ++c) pos_buf_[c] = past_length_;
+        cache_pos_buf_[0] = past_length_;
+        fill_attn_mask(1);
+
+        for (int i = 0; i < cfg_.num_blocks; ++i) {
+            auto t0 = std::chrono::steady_clock::now();
+            gdn_requests_[i].infer();
+            decode_gdn_ms_[i] += elapsed_ms(t0);
+
+            t0 = std::chrono::steady_clock::now();
+            attn_requests_[i].infer();
+            // Copy outputs — NPU may squeeze S=1 dim; KV aliased I/O causes 2x slowdown
+            std::memcpy(hidden_buf_.data(),
+                        attn_requests_[i].get_output_tensor(0).data<const float>(),
+                        H * sizeof(float));
+            std::memcpy(kv_key_tensors_[i].data<float>(),
+                        attn_requests_[i].get_output_tensor(1).data<const float>(),
+                        kv_total_ * sizeof(float));
+            std::memcpy(kv_value_tensors_[i].data<float>(),
+                        attn_requests_[i].get_output_tensor(2).data<const float>(),
+                        kv_total_ * sizeof(float));
+            decode_attn_ms_[i] += elapsed_ms(t0);
+        }
+
+        past_length_ += 1;
+
+        if (!run_head) return nullptr;
+
+        auto t0 = std::chrono::steady_clock::now();
+        head_request_.infer();
+        decode_head_ms_ += elapsed_ms(t0);
+        decode_steps_++;
+
+        return head_request_.get_output_tensor(0).data<const float>();
+    }
+
+    // --- Multi-token path (used by chunk-based prefill fallback) ---
     bool use_prefill = (attn_prefill_requests_.count(seq_len) > 0);
 
-    // 6 × (GDN → Attn)
     for (int i = 0; i < cfg_.num_blocks; ++i) {
         run_gdn_block(i, seq_len);
         run_attn_block(i, seq_len, use_prefill);
@@ -127,14 +204,11 @@ const float* Qwen35HybridModel::forward(
 
     if (!run_head) return nullptr;
 
-    // For multi-token input (last prefill chunk), run head on LAST token only.
-    // Saves (chunk_size-1) × matmul(hidden_size, vocab_size) on GPU (~5ms).
     if (seq_len > 1) {
         std::memmove(hidden_buf_.data(),
                      hidden_buf_.data() + (seq_len - 1) * H,
                      H * sizeof(float));
     }
-    head_request_.set_input_tensor(0, s1_hidden_);
     head_request_.infer();
 
     return head_request_.get_output_tensor(0).data<const float>();
@@ -194,11 +268,17 @@ const float* Qwen35HybridModel::prefill(const int64_t* token_ids, int prompt_len
     for (int layer = 0; layer < cfg_.num_blocks; ++layer) {
         // --- GDN block (GPU): full prompt at once ---
         auto gdn_t0 = std::chrono::steady_clock::now();
-        auto& gdn_req = gdn_requests_[layer];
-        gdn_req.set_input_tensor(0, full_hidden_tensor);
-        gdn_req.set_input_tensor(1, full_mask_tensor);
-        gdn_req.set_output_tensor(0, full_hidden_tensor);
-        gdn_req.infer();
+        if (has_gdn_prefill_) {
+            // Chunkwise parallel GDN (no Loop, MatMul-based)
+            run_gdn_prefill_block(layer, full_hidden_tensor, full_mask_tensor);
+        } else {
+            // Fallback: Loop-based stateful GDN (sequential)
+            auto& gdn_req = gdn_requests_[layer];
+            gdn_req.set_input_tensor(0, full_hidden_tensor);
+            gdn_req.set_input_tensor(1, full_mask_tensor);
+            gdn_req.set_output_tensor(0, full_hidden_tensor);
+            gdn_req.infer();
+        }
         gdn_times[layer] = elapsed_ms(gdn_t0);
 
         // --- Attention block (NPU): chunked ---
@@ -229,6 +309,14 @@ const float* Qwen35HybridModel::prefill(const int64_t* token_ids, int prompt_len
 
     // Set past_length for decode phase
     past_length_ = prompt_len;
+
+    // Transfer chunkwise prefill states to stateful decode blocks
+    if (has_gdn_prefill_) {
+        transfer_prefill_states_to_decode();
+    }
+
+    // Restore decode tensor bindings (prefill may rebind GDN requests to full_hidden_tensor)
+    bind_decode_tensors();
 
     // Head: last token only
     std::memcpy(hidden_buf_.data(),
@@ -312,10 +400,13 @@ std::string Qwen35HybridModel::generate(const std::string& prompt, int max_new_t
     log("Prompt tokens: " + std::to_string(prompt_len) +
         " (chunk=" + std::to_string(chunk_size) + ")");
 
+    // Initialize decode timing accumulators
+    decode_gdn_ms_.assign(cfg_.num_blocks, 0.0);
+    decode_attn_ms_.assign(cfg_.num_blocks, 0.0);
+    decode_head_ms_ = 0;
+    decode_steps_ = 0;
+
     // --- Prefill: layer-major (full-batch GDN + chunked NPU attention) ---
-    // Each layer: GDN processes full prompt at once (GPU), then attention
-    // processes in chunks (NPU, S=16/8/4/2). Fewer GDN dispatches, head
-    // runs once, Loop amortized.
     auto t0 = std::chrono::steady_clock::now();
     const float* logits = prefill(input_ids.data(), prompt_len);
 
@@ -352,6 +443,36 @@ std::string Qwen35HybridModel::generate(const std::string& prompt, int max_new_t
         log("Decode: " + std::to_string(num_decoded) + " tokens in " +
             std::to_string(decode_ms) + " ms (" +
             std::to_string(num_decoded / (decode_ms / 1000.0)) + " tok/s)");
+
+        // Print decode timing breakdown
+        double gdn_total = 0, attn_total = 0;
+        for (int i = 0; i < cfg_.num_blocks; ++i) {
+            gdn_total += decode_gdn_ms_[i];
+            attn_total += decode_attn_ms_[i];
+        }
+        double per_tok = decode_ms / decode_steps_;
+        log("=== Decode Timing Breakdown (avg per token: " +
+            std::to_string(per_tok).substr(0, std::to_string(per_tok).find('.') + 2) + "ms) ===");
+        for (int i = 0; i < cfg_.num_blocks; ++i) {
+            double gdn_avg = decode_gdn_ms_[i] / decode_steps_;
+            double attn_avg = decode_attn_ms_[i] / decode_steps_;
+            log("  Block " + std::to_string(i) + ": GDN=" +
+                std::to_string(gdn_avg).substr(0, std::to_string(gdn_avg).find('.') + 2) +
+                "ms  Attn=" +
+                std::to_string(attn_avg).substr(0, std::to_string(attn_avg).find('.') + 2) + "ms");
+        }
+        double gdn_avg = gdn_total / decode_steps_;
+        double attn_avg = attn_total / decode_steps_;
+        double head_avg = decode_head_ms_ / decode_steps_;
+        log("  Total: GDN=" +
+            std::to_string(gdn_avg).substr(0, std::to_string(gdn_avg).find('.') + 2) +
+            "ms (" + std::to_string(gdn_total / decode_ms * 100).substr(0, 4) +
+            "%)  Attn=" +
+            std::to_string(attn_avg).substr(0, std::to_string(attn_avg).find('.') + 2) +
+            "ms (" + std::to_string(attn_total / decode_ms * 100).substr(0, 4) +
+            "%)  Head=" +
+            std::to_string(head_avg).substr(0, std::to_string(head_avg).find('.') + 2) +
+            "ms (" + std::to_string(decode_head_ms_ / decode_ms * 100).substr(0, 4) + "%)");
     }
 
     if (!generated.empty() && stop_ids.count(static_cast<int>(generated.back()))) {

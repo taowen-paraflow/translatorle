@@ -23,11 +23,14 @@ Qwen35HybridModel::Qwen35HybridModel(
     const std::string& model_dir,
     int attn_past_seq,
     int prefill_chunk_size,
-    const std::string& tokenizers_lib)
+    const std::string& tokenizers_lib,
+    bool use_latency_hint,
+    bool no_gdn_prefill)
     : attn_past_seq_(attn_past_seq),
       prefill_chunk_size_(prefill_chunk_size),
       past_length_(0),
-      kv_total_(0)
+      kv_total_(0),
+      use_latency_hint_(use_latency_hint)
 {
     cfg_ = load_config(model_dir);
     log("Config: hidden=" + std::to_string(cfg_.hidden_size) +
@@ -42,11 +45,20 @@ Qwen35HybridModel::Qwen35HybridModel(
     core_.set_property(ov::cache_dir(cache_dir));
     log("Model cache: " + cache_dir);
 
-    load_gdn_blocks(model_dir);
-    load_attn_blocks(model_dir);
-    load_head(model_dir);
+    // Load order matters for thermal management on Lunar Lake iGPU:
+    // NPU models first (doesn't heat GPU), then GPU models.
+    // This gives the GPU cooling time between compilation and inference.
+    load_attn_blocks(model_dir);         // NPU — no GPU heat
+    load_gdn_blocks(model_dir);          // GPU — decode critical
+    load_head(model_dir);                // GPU — decode critical
+    if (!no_gdn_prefill) {
+        load_gdn_prefill_blocks(model_dir);  // GPU — prefill only, loaded last
+    } else {
+        log("Skipping GDN prefill blocks (--no-gdn-prefill)");
+    }
     load_embeddings(model_dir);
     alloc_buffers();
+    bind_decode_tensors();
 
     // Initialize tokenizer
     std::string tok_xml = model_dir + "/openvino_tokenizer.xml";
@@ -131,15 +143,58 @@ void Qwen35HybridModel::load_gdn_blocks(const std::string& model_dir) {
         auto model = core_.read_model(xml);
         ov::pass::MakeStateful(state_map).run_on_model(model);
         model = add_f32_output_conversion(model);
-        auto compiled = core_.compile_model(model, "GPU",
-            ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY),
-            ov::hint::num_requests(1));
+        ov::AnyMap gpu_config = {
+            {ov::hint::num_requests.name(), uint32_t(1)}
+        };
+        if (use_latency_hint_) {
+            gpu_config[ov::hint::performance_mode.name()] = ov::hint::PerformanceMode::LATENCY;
+        }
+        auto compiled = core_.compile_model(model, "GPU", gpu_config);
         gdn_models_.push_back(compiled);
         gdn_requests_.push_back(compiled.create_infer_request());
     }
 
     init_gdn_states();
     log("  GDN compilation: " + std::to_string(elapsed_ms(t0)) + " ms");
+}
+
+// ---------------------------------------------------------------------------
+// GDN prefill block loading (GPU, explicit I/O, chunkwise parallel)
+// ---------------------------------------------------------------------------
+
+void Qwen35HybridModel::load_gdn_prefill_blocks(const std::string& model_dir) {
+    std::string test_xml = model_dir + "/gdn_prefill_block_0.xml";
+    if (!fs::exists(test_xml)) {
+        log("No chunkwise GDN prefill blocks found, using Loop-based prefill");
+        return;
+    }
+
+    log("Compiling " + std::to_string(cfg_.num_blocks) +
+        " GDN prefill blocks on GPU (explicit I/O, FP32)...");
+    auto t0 = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < cfg_.num_blocks; ++i) {
+        std::string xml = model_dir + "/gdn_prefill_block_" + std::to_string(i) + ".xml";
+        auto model = core_.read_model(xml);
+        model = add_f32_output_conversion(model);
+
+        // Force FP32 inference: the Neumann series (7 matrix squarings)
+        // accumulates catastrophic precision loss in FP16.
+        ov::AnyMap gpu_config = {
+            {ov::hint::num_requests.name(), uint32_t(1)},
+            {"INFERENCE_PRECISION_HINT", "f32"}
+        };
+        if (use_latency_hint_) {
+            gpu_config[ov::hint::performance_mode.name()] = ov::hint::PerformanceMode::LATENCY;
+        }
+        auto compiled = core_.compile_model(model, "GPU", gpu_config);
+        gdn_prefill_models_.push_back(compiled);
+        gdn_prefill_requests_.push_back(compiled.create_infer_request());
+    }
+
+    has_gdn_prefill_ = true;
+    init_gdn_prefill_states();
+    log("  GDN prefill compilation: " + std::to_string(elapsed_ms(t0)) + " ms");
 }
 
 // ---------------------------------------------------------------------------
@@ -187,9 +242,11 @@ void Qwen35HybridModel::load_attn_blocks(const std::string& model_dir) {
 
         ov::AnyMap npu_config = {
             {"NPU_COMPILER_TYPE", "PREFER_PLUGIN"},
-            {ov::hint::performance_mode.name(), ov::hint::PerformanceMode::LATENCY},
             {ov::hint::num_requests.name(), uint32_t(1)}
         };
+        if (use_latency_hint_) {
+            npu_config[ov::hint::performance_mode.name()] = ov::hint::PerformanceMode::LATENCY;
+        }
         auto compiled = core_.compile_model(model, "NPU", npu_config);
         attn_models_.push_back(compiled);
         attn_requests_.push_back(compiled.create_infer_request());
@@ -236,9 +293,11 @@ void Qwen35HybridModel::load_attn_blocks(const std::string& model_dir) {
 
                 ov::AnyMap npu_config = {
                     {"NPU_COMPILER_TYPE", "PREFER_PLUGIN"},
-                    {ov::hint::performance_mode.name(), ov::hint::PerformanceMode::LATENCY},
                     {ov::hint::num_requests.name(), uint32_t(1)}
                 };
+                if (use_latency_hint_) {
+                    npu_config[ov::hint::performance_mode.name()] = ov::hint::PerformanceMode::LATENCY;
+                }
                 auto compiled = core_.compile_model(model, "NPU", npu_config);
                 models.push_back(compiled);
                 requests.push_back(compiled.create_infer_request());
@@ -263,9 +322,13 @@ void Qwen35HybridModel::load_head(const std::string& model_dir) {
 
     auto model = core_.read_model(model_dir + "/head.xml");
     model = add_f32_output_conversion(model);
-    head_model_ = core_.compile_model(model, "GPU",
-        ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY),
-        ov::hint::num_requests(1));
+    ov::AnyMap gpu_config = {
+        {ov::hint::num_requests.name(), uint32_t(1)}
+    };
+    if (use_latency_hint_) {
+        gpu_config[ov::hint::performance_mode.name()] = ov::hint::PerformanceMode::LATENCY;
+    }
+    head_model_ = core_.compile_model(model, "GPU", gpu_config);
     head_request_ = head_model_.create_infer_request();
 
     log("  Head compilation: " + std::to_string(elapsed_ms(t0)) + " ms");
@@ -394,11 +457,94 @@ void Qwen35HybridModel::init_gdn_states() {
 }
 
 // ---------------------------------------------------------------------------
+// GDN prefill state initialization (explicit buffers, zero-filled)
+// ---------------------------------------------------------------------------
+
+void Qwen35HybridModel::init_gdn_prefill_states() {
+    int conv_dim = cfg_.conv_dim;
+    int conv_kernel = cfg_.conv_kernel;
+    int num_v = cfg_.num_v_heads;
+    int kd = cfg_.k_head_dim;
+    int vd = cfg_.v_head_dim;
+
+    gdn_prefill_conv_states_.resize(cfg_.num_blocks);
+    gdn_prefill_rec_states_.resize(cfg_.num_blocks);
+
+    for (int i = 0; i < cfg_.num_blocks; ++i) {
+        gdn_prefill_conv_states_[i].resize(3);
+        gdn_prefill_rec_states_[i].resize(3);
+        for (int j = 0; j < 3; ++j) {
+            gdn_prefill_conv_states_[i][j] = ov::Tensor(ov::element::f32,
+                {1, static_cast<size_t>(conv_dim), static_cast<size_t>(conv_kernel)});
+            std::memset(gdn_prefill_conv_states_[i][j].data<float>(), 0,
+                        conv_dim * conv_kernel * sizeof(float));
+
+            gdn_prefill_rec_states_[i][j] = ov::Tensor(ov::element::f32,
+                {1, static_cast<size_t>(num_v), static_cast<size_t>(kd),
+                 static_cast<size_t>(vd)});
+            std::memset(gdn_prefill_rec_states_[i][j].data<float>(), 0,
+                        num_v * kd * vd * sizeof(float));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transfer chunkwise prefill states to stateful decode GDN blocks
+// ---------------------------------------------------------------------------
+
+void Qwen35HybridModel::transfer_prefill_states_to_decode() {
+    for (int blk = 0; blk < cfg_.num_blocks; ++blk) {
+        for (auto& s : gdn_requests_[blk].query_state()) {
+            std::string name = s.get_name();
+            for (int j = 0; j < 3; ++j) {
+                if (name.find("conv" + std::to_string(j)) != std::string::npos) {
+                    s.set_state(gdn_prefill_conv_states_[blk][j]);
+                    break;
+                }
+                if (name.find("rec" + std::to_string(j)) != std::string::npos) {
+                    s.set_state(gdn_prefill_rec_states_[blk][j]);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pre-bind decode tensors (S=1) — call once after alloc_buffers()
+// Avoids 55+ set_input/output_tensor calls per decode step.
+// Only position_ids, cache_position, and attn_mask content change per step.
+// ---------------------------------------------------------------------------
+
+void Qwen35HybridModel::bind_decode_tensors() {
+    for (int i = 0; i < cfg_.num_blocks; ++i) {
+        auto& gdn_req = gdn_requests_[i];
+        gdn_req.set_input_tensor(0, s1_hidden_);
+        gdn_req.set_input_tensor(1, s1_gdn_mask_);
+        gdn_req.set_output_tensor(0, s1_hidden_);
+
+        // NPU attention (used during prefill with S=1 fallback)
+        auto& attn_req = attn_requests_[i];
+        attn_req.set_input_tensor(0, s1_hidden_);
+        attn_req.set_input_tensor(1, s1_pos_);
+        attn_req.set_input_tensor(2, kv_key_tensors_[i]);
+        attn_req.set_input_tensor(3, kv_value_tensors_[i]);
+        attn_req.set_input_tensor(4, s1_cache_pos_);
+        attn_req.set_input_tensor(5, s1_attn_mask_);
+
+    }
+    head_request_.set_input_tensor(0, s1_hidden_);
+}
+
+// ---------------------------------------------------------------------------
 // Reset all states for a new generation
 // ---------------------------------------------------------------------------
 
 void Qwen35HybridModel::reset() {
     init_gdn_states();
+    if (has_gdn_prefill_) {
+        init_gdn_prefill_states();
+    }
     // Reset KV caches to zeros (fixed-size, stays allocated)
     for (int i = 0; i < cfg_.num_blocks; ++i) {
         std::memset(kv_key_tensors_[i].data<float>(), 0, kv_total_ * sizeof(float));

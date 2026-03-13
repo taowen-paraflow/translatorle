@@ -52,7 +52,7 @@ Qwen3.5 使用 **Gated Delta Networks (GDN) 混合架构**，不是标准 Transf
 | CPU | 正常 | ~1.5 tok/s | ~3.6 tok/s | 稳定 |
 | **GPU_ONLY** | **正常** | **9.1 tok/s** | **22.6 tok/s** | 全 stateful，ScatterUpdate-3 KV cache |
 | **HYBRID (GPU+NPU) Python** | **正常** | **~60 tok/s** | **14.9 tok/s** | GDN→GPU(stateful), Attn→NPU(explicit), layer-major prefill (full-batch GDN + chunked attn S=16/8/4/2) |
-| **HYBRID (GPU+NPU) C++** | **正常** | **~6 tok/s** | **16-18 tok/s** | 同 Python 架构，零分配热循环，GPU set_output_tensor 零拷贝 |
+| **HYBRID (GPU+NPU) C++** | **正常** | **~24 tok/s** | **21 tok/s peak / 10-14 sustained** | 同 Python 架构 + chunkwise GDN prefill + 量化(INT4/INT8) + 零分配热循环。Lunar Lake 热节流导致 sustained 降 |
 | NPU only | 不可用 | — | — | GDN 递归 FP16 精度不足 |
 
 ### NPU 单独跑 GDN 不行，但 attention 子图可以
@@ -208,6 +208,7 @@ NPU stateful（ReadValue/Assign）在子图模式下有固有开销：
 7. **GPU attention prefill** ✗ — 在 HYBRID 模式 prefill 时将 attention 放 GPU（动态 shape，一次调用处理全 prompt）而非 NPU（chunked S=16/8/4/2）。结果 prefill 反而 0.79x 更慢。原因：GPU 已在跑 GDN（占 73% 时间），再加 attention 造成 GPU 争抢。NPU chunked prefill 已经和 GPU_ONLY 持平 (1.01x)。**结论：HYBRID prefill 时 attention 应保留在 NPU**。代码仍保留（`--no-attn-gpu-prefill` 默认关闭），可供对比
 8. **PERFORMANCE_HINT: LATENCY** ✗ — 在 Python inference 中对 GPU/NPU 所有子图设置 `PERFORMANCE_HINT: LATENCY`（C++ 版已使用）。结果 Python 版 decode 从 ~14 tok/s 降到 ~9.7 tok/s（**30% 退化**）。C++ 用 LATENCY 有效可能因为 C++ 调用路径不同。**结论：Python OpenVINO API 不应设置 LATENCY hint**
 9. **Prefill 后释放 GPU 内存** ✗ — Prefill 完成后释放 GDN prefill blocks + attention prefill blocks（~1.5GB GPU）。A/B 测试无改善（0.94x），GPU memory pressure 假说不成立。**结论：OpenVINO CompiledModel 内存不影响其他模型推理速度**
+10. **GPU stateful attention for decode** ✗ — 将 decode 阶段的 attention 从 NPU（explicit I/O + memcpy）改为 GPU（MakeStateful，零 memcpy），期望消除 ~1MB KV cache memcpy/block。结果 decode 从 21 降到 10.5 tok/s（**50% 退化**）。原因：Lunar Lake iGPU 资源有限，额外 6 个 GPU attention 模型导致所有 GPU 操作（包括 GDN）变慢 2.2x。**结论：iGPU 上不能同时运行 GDN + attention on GPU，即使是串行执行。NPU attention 虽有 memcpy 开销，但整体更快**
 
 #### 待尝试优化
 
@@ -217,11 +218,18 @@ NPU stateful（ReadValue/Assign）在子图模式下有固有开销：
 - ✓ **Attention block 权重 INT4** → 已验证 INT4_SYM 安全
 - ~~**Batch prefill**~~ → 已实现为 Chunked prefill
 - ~~**GPU attention prefill**~~ ✗ → GPU 争抢
+- ~~**GPU attention decode**~~ ✗ → GPU 资源争抢，2.2x 退化
 - ~~**LATENCY hint**~~ ✗ → Python API 不兼容
 
-#### 瓶颈分析（profiling 实测，含 profiling overhead）
+#### 瓶颈分析（profiling 实测）
 
-**HYBRID NPU explicit**（7.9 tok/s with profiling，无 profiling ~11-14 tok/s）：
+**C++ HYBRID decode**（21 tok/s peak，量化 INT4+INT8，GPU 冷态）：
+- GDN blocks x 6：33.3ms（**69%**）— 绝对主导瓶颈，~5.5ms/block
+- Attn blocks x 6：11.1ms（23%）— NPU ~1.8ms/block + KV memcpy
+- Head：3.0ms（6%）
+- Overhead：<0.1ms — 零分配热循环
+
+**Python HYBRID decode**（7.9 tok/s with profiling，无 profiling ~11-14 tok/s）：
 - GDN blocks x 6：95.2ms（**73.6%**）— 绝对主导瓶颈
 - Attn blocks x 6：24.2ms（18.7%）— NPU ~4ms/block
 - Head：9.7ms（7.5%）
@@ -276,20 +284,30 @@ uv run python -m qwen35.scripts.test_quality --model-dir models/qwen35/Qwen3.5-0
 
 ### C++ Hybrid 推理
 
-C++ 实现与 Python 使用相同的 13 子图架构，额外优化：
+C++ 实现与 Python 使用相同的 19 子图架构（6 GDN decode + 6 GDN prefill + 6 Attn + 1 Head），额外优化：
 - GPU `set_output_tensor` 零拷贝（GDN hidden 输出直接写入 host buffer）
-- GPU/NPU `LATENCY` 性能提示 + `NUM_REQUESTS=1`
+- `NUM_REQUESTS=1` 减少资源争抢（`LATENCY` hint 默认关闭，可通过 `--latency` 开启）
 - 预分配所有 tensor wrapper，decode 热循环零堆分配
-- Prefill 末尾只对最后一个 token 运行 Head（省 ~5ms GPU 计算）
+- Chunkwise parallel GDN prefill（无 Loop，MatMul-based，需 FP32）
+- Layer-major prefill + 只对最后一个 token 运行 Head
+- 模型加载顺序优化：NPU 先（给 GPU 散热时间），GPU 后
 - NPU `set_output_tensor` 会 2x 减速（KV aliased buffer 触发内部拷贝），保留 memcpy
 - NPU hidden 输出 shape 与输入不同（S=1 时 [B,H] 而非 [B,1,H]），必须 memcpy
+
+**性能（量化模型 INT4+INT8，4.1GB）：**
+- **Decode peak**: ~21 tok/s（GPU 冷态）
+- **Decode sustained**: 10-14 tok/s（GPU 热态，受 Lunar Lake 热节流影响）
+- **Prefill**: ~24 tok/s（chunkwise parallel GDN）
+
+**注意**：Lunar Lake iGPU 热节流严重。GPU 时钟可从 peak 降到 1/3。连续 GPU 密集操作（编译、推理）后性能可降 50-70%。benchmark 必须考虑热状态。后台进程（VS Code、音乐播放器等）共享热包络，会加剧节流。
 
 **构建与运行：**
 ```powershell
 .\qwen35\cpp\build.ps1                              # 编译
-.\qwen35\cpp\run.ps1 -Prompt "Hello" -MaxTokens 50  # 运行 C++
+.\qwen35\cpp\run.ps1 -Prompt "Hello" -MaxTokens 50  # 运行 C++（默认量化模型）
 .\qwen35\cpp\run-python.ps1 -Prompt "Hello"          # 对比 Python
 .\qwen35\cpp\clear-cache.ps1                         # 清缓存（改编译参数后需要）
+# 选项：--latency（启用 LATENCY hint）、--no-gdn-prefill（跳过 chunkwise prefill）
 ```
 
 ## 标准导出流水线（单 IR）
