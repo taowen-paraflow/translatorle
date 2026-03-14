@@ -650,12 +650,13 @@ def export_head(norm, lm_head, text_cfg, output_dir):
 # Main orchestration
 # ---------------------------------------------------------------------------
 
-def export_hybrid_subgraphs(model_dir: str, output_dir: str):
+def export_hybrid_subgraphs(model_dir: str, output_dir: str, paro_model: str | None = None):
     """Export 13 independent subgraph IRs for hybrid GPU+NPU inference.
 
     Args:
         model_dir: HuggingFace model path or local directory.
         output_dir: Directory for output IR files.
+        paro_model: Optional path to PARO model for rotation-based INT4 quantization.
     """
     logger.info("Loading PyTorch model from %s ...", model_dir)
     model = AutoModelForCausalLM.from_pretrained(
@@ -665,6 +666,18 @@ def export_hybrid_subgraphs(model_dir: str, output_dir: str):
 
     text_cfg = getattr(model.config, "text_config", model.config)
     layer_types = text_cfg.layer_types
+
+    # Apply PARO rotation to linear layers (before tracing)
+    if paro_model:
+        from qwen35.paro_rotation import extract_paro_params, apply_paro_rotation_to_module
+        logger.info("Applying PARO rotation from %s ...", paro_model)
+        paro_params = extract_paro_params(paro_model)
+        total_rotated = 0
+        for i, layer in enumerate(model.model.layers):
+            layer_prefix = f"layers.{i}"
+            n = apply_paro_rotation_to_module(layer, paro_params, layer_prefix)
+            total_rotated += n
+        logger.info("PARO rotation applied to %d linear layers", total_rotated)
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -741,8 +754,12 @@ if __name__ == "__main__":
         choices=["select", "index_copy", "scatter_elements", "scatter_nd", "scatter_update_ext"],
         help="KV cache update method: select (torch.where), index_copy (torch.index_copy_), scatter_elements (torch.scatter), scatter_nd (torch.index_put), scatter_update_ext (ConversionExtension -> ScatterUpdate-3)",
     )
+    parser.add_argument(
+        "--paro-model", default=None,
+        help="Path to PARO model for rotation-based INT4 quantization (e.g., models/qwen35/Qwen3.5-0.8B-PARO)",
+    )
     args = parser.parse_args()
 
     FixedKVCache.update_method = args.kv_update_method
     logger.info("KV update method: %s", args.kv_update_method)
-    export_hybrid_subgraphs(args.model_dir, args.output_dir)
+    export_hybrid_subgraphs(args.model_dir, args.output_dir, paro_model=args.paro_model)

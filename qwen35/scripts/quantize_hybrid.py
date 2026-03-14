@@ -15,7 +15,7 @@ Usage (root venv):
 
 Notes:
     - NPU requires INT4_SYM (not ASYM) -- ASYM falls back to slow path on NPU
-    - GDN blocks contain Loop nodes with FP32 recurrence -- INT4 is too risky
+    - GDN blocks contain Loop nodes with FP32 recurrence -- INT4 may affect quality
     - For <=1B models, INT4 on NPU may be slower (dequant overhead > bandwidth saving)
 """
 
@@ -129,8 +129,8 @@ def main():
     parser.add_argument(
         "--gdn-mode",
         default="fp16",
-        choices=["fp16", "int8_sym", "int8_asym"],
-        help="Quantization for GDN blocks (default: %(default)s). No INT4 -- too risky for recurrence.",
+        choices=["fp16", "int4_sym", "int8_sym", "int8_asym"],
+        help="Quantization for GDN blocks (default: %(default)s).",
     )
     parser.add_argument(
         "--head-mode",
