@@ -277,10 +277,24 @@ class Qwen35HybridModel:
         self._head_request = self._head_model.create_infer_request()
         logger.info("  Head compilation: %.1fs", time.time() - t0)
 
-        # --- Embedding table (load as float32 to avoid indexing issues) ---
-        embed_path = model_dir / "embed_tokens.npy"
-        self._embed_table = np.load(str(embed_path)).astype(np.float32)
-        logger.info("Loaded embed_tokens: shape=%s dtype=%s", self._embed_table.shape, self._embed_table.dtype)
+        # --- Embedding table ---
+        # Prefer INT8 quantized embeddings (2x smaller) with FP16 fallback
+        embed_int8_path = model_dir / "embed_tokens_int8.npy"
+        embed_scales_path = model_dir / "embed_tokens_scales.npy"
+        if embed_int8_path.exists() and embed_scales_path.exists():
+            self._embed_int8 = np.load(str(embed_int8_path))        # [vocab, dim] int8
+            self._embed_scales = np.load(str(embed_scales_path))    # [vocab] float16
+            self._embed_table = None
+            logger.info(
+                "Loaded INT8 embed_tokens: shape=%s + scales shape=%s",
+                self._embed_int8.shape, self._embed_scales.shape,
+            )
+        else:
+            embed_path = model_dir / "embed_tokens.npy"
+            self._embed_table = np.load(str(embed_path)).astype(np.float32)
+            self._embed_int8 = None
+            self._embed_scales = None
+            logger.info("Loaded embed_tokens: shape=%s dtype=%s", self._embed_table.shape, self._embed_table.dtype)
 
         # --- Tokenizer ---
         from transformers import AutoTokenizer
@@ -291,6 +305,22 @@ class Qwen35HybridModel:
         # Profiling instrumentation (disable for clean benchmarks)
         self._profiling = False
         self._reset_profile_stats()
+
+    def _embed_lookup(self, token_ids: np.ndarray) -> np.ndarray:
+        """Look up token embeddings, dequantizing INT8 if needed.
+
+        Args:
+            token_ids: Shape [B, seq_len] int64.
+
+        Returns:
+            embeddings: Shape [B, seq_len, hidden] float32.
+        """
+        if self._embed_int8 is not None:
+            # INT8 per-row dequantization: int8[token_ids] * scales[token_ids]
+            raw = self._embed_int8[token_ids].astype(np.float32)          # [B, S, H]
+            scales = self._embed_scales[token_ids].astype(np.float32)     # [B, S]
+            return raw * scales[..., np.newaxis]                          # broadcast [B, S, 1]
+        return self._embed_table[token_ids]
 
     def _reset_profile_stats(self):
         """Reset accumulated profiling counters."""
@@ -392,26 +422,24 @@ class Qwen35HybridModel:
     def _reshape_attn_static(self, ir, past_seq: int, seq_len: int = 1):
         """Reshape attention IR to fully static shapes for NPU compilation.
 
-        Uses index-based access to avoid name collision issues.
-        With fixed-size KV cache, cache dim is already past_seq (MAX_CACHE_LEN).
+        Uses set_partial_shape() + validate_nodes_and_infer_types() instead of
+        ir.reshape() to avoid breaking Broadcast nodes when PARO RotatedLinear
+        adds reshape/permute/bmm ops that confuse OpenVINO's shape propagation.
         """
         B, S = 1, seq_len
         # Index-based: 0=hidden, 1=position_ids, 2=key_cache, 3=value_cache,
         #              4=cache_position, 5=attention_mask
-        shapes = {}
-        for i, inp in enumerate(ir.inputs):
-            name = inp.get_any_name()
-            if i == 0:  # hidden: [B, S, hidden_size]
-                shapes[name] = ov.PartialShape([B, S, self._hidden_size])
-            elif i == 1:  # position_ids: [3, B, S]
-                shapes[name] = ov.PartialShape([3, B, S])
-            elif i in (2, 3):  # key/value cache: [B, num_kv_heads, past_seq, head_dim]
-                shapes[name] = ov.PartialShape([B, self._num_kv_heads, past_seq, self._head_dim])
-            elif i == 4:  # cache_position: [S]
-                shapes[name] = ov.PartialShape([S])
-            elif i == 5:  # attention_mask: [B, 1, S, past_seq]
-                shapes[name] = ov.PartialShape([B, 1, S, past_seq])
-        ir.reshape(shapes)
+        shape_map = {
+            0: [B, S, self._hidden_size],                              # hidden
+            1: [3, B, S],                                              # position_ids
+            2: [B, self._num_kv_heads, past_seq, self._head_dim],      # key_cache
+            3: [B, self._num_kv_heads, past_seq, self._head_dim],      # value_cache
+            4: [S],                                                    # cache_position
+            5: [B, 1, S, past_seq],                                    # attention_mask
+        }
+        for i, shape in shape_map.items():
+            ir.inputs[i].get_node().set_partial_shape(ov.PartialShape(shape))
+        ir.validate_nodes_and_infer_types()
         return ir
 
     def _reshape_gdn_prefill_static(self, ir, seq_len: int):
@@ -612,10 +640,10 @@ class Qwen35HybridModel:
 
         batch_size, seq_len = token_ids.shape
 
-        # Embed tokens — already float32, index gives [B, seq_len, hidden]
+        # Embed tokens — float32, index gives [B, seq_len, hidden]
         if profiling:
             t0 = time.perf_counter()
-        embeds = self._embed_table[token_ids]
+        embeds = self._embed_lookup(token_ids)
         if profiling:
             self._profile_stats['embed'].append(time.perf_counter() - t0)
 
@@ -719,7 +747,7 @@ class Qwen35HybridModel:
                 gdn_pos += cs
 
         # Embed full prompt
-        hidden = self._embed_table[token_ids]  # [B, prompt_len, H]
+        hidden = self._embed_lookup(token_ids)  # [B, prompt_len, H]
 
         for layer_idx in range(self._num_blocks):
             # --- GDN block ---

@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 
 import nncf
+import numpy as np
 import openvino as ov
 
 # NNCF compression mode mapping
@@ -59,6 +60,46 @@ def get_ir_size(directory: Path, stem: str) -> int:
         if p.exists():
             total += p.stat().st_size
     return total
+
+
+def find_paro_rotation_ops(model, group_size=128):
+    """Find MatMul/BatchMatMul ops with PARO rotation matrix constants.
+
+    PARO rotation matrices appear as Constant inputs to MatMul ops with
+    shape (num_groups, group_size, group_size) — e.g., (8, 128, 128).
+    Also matches Multiply ops for channel_scales with shape (1, dim).
+
+    Returns list of op friendly names to exclude from NNCF compression.
+    """
+    names = []
+    for op in model.get_ops():
+        op_type = op.get_type_name()
+        if op_type not in ("MatMul", "Multiply"):
+            continue
+        for input_idx in range(op.get_input_size()):
+            source = op.input(input_idx).get_source_output().get_node()
+            # Walk through Convert nodes (inserted by FP16 compression)
+            while source.get_type_name() == "Convert":
+                source = source.input(0).get_source_output().get_node()
+            if source.get_type_name() != "Constant":
+                continue
+            shape = list(source.get_output_shape(0))
+            # Match rotation matrix: (num_groups, group_size, group_size)
+            if (len(shape) == 3
+                and shape[1] == group_size
+                and shape[2] == group_size
+                and shape[0] >= 1):
+                names.append(op.get_friendly_name())
+                break
+            # Match channel_scales: (1, dim) where dim is multiple of group_size
+            if (op_type == "Multiply"
+                and len(shape) == 2
+                and shape[0] == 1
+                and shape[1] >= group_size
+                and shape[1] % group_size == 0):
+                names.append(op.get_friendly_name())
+                break
+    return names
 
 
 def compress_ir(
@@ -95,6 +136,13 @@ def compress_ir(
     kwargs = {"mode": mode}
     if "int4" in mode_str:
         kwargs["group_size"] = group_size
+
+    # Protect PARO rotation matrices from quantization
+    rotation_ops = find_paro_rotation_ops(model)
+    if rotation_ops:
+        kwargs["ignored_scope"] = nncf.IgnoredScope(names=rotation_ops)
+        print(f" (protecting {len(rotation_ops)} PARO rotation ops)", end="", flush=True)
+
     compressed = nncf.compress_weights(model, **kwargs)
     elapsed = time.time() - t0
 
@@ -236,6 +284,31 @@ def main():
         # Skip subgraph IR files (already handled)
         file_stem = src_file.stem  # e.g. "gdn_block_0" from "gdn_block_0.xml"
         if file_stem in subgraph_stems and src_file.suffix in (".xml", ".bin"):
+            continue
+
+        # Quantize embed_tokens.npy to INT8 per-row symmetric
+        if src_file.name == "embed_tokens.npy":
+            print(f"  Quantizing {src_file.name} to INT8 per-row ...", end="", flush=True)
+            embed_fp16 = np.load(str(src_file))  # [vocab, dim] float16
+            orig_size = src_file.stat().st_size
+            embed_fp32 = embed_fp16.astype(np.float32)
+            scales = np.max(np.abs(embed_fp32), axis=1, keepdims=True) / 127.0  # [vocab, 1]
+            scales = np.where(scales == 0, 1.0, scales)  # avoid division by zero
+            embed_int8 = np.round(embed_fp32 / scales).astype(np.int8)  # [vocab, dim]
+            scales_fp16 = scales.squeeze().astype(np.float16)  # [vocab]
+            np.save(str(dst_dir / "embed_tokens_int8.npy"), embed_int8)
+            np.save(str(dst_dir / "embed_tokens_scales.npy"), scales_fp16)
+            int8_size = (dst_dir / "embed_tokens_int8.npy").stat().st_size
+            scales_size = (dst_dir / "embed_tokens_scales.npy").stat().st_size
+            total_size = int8_size + scales_size
+            ratio = orig_size / total_size if total_size > 0 else 0
+            print(
+                f" {format_size(orig_size)} -> {format_size(total_size)} ({ratio:.1f}x)"
+                f"\n    embed_tokens_int8.npy:   {format_size(int8_size)}"
+                f"\n    embed_tokens_scales.npy: {format_size(scales_size)}"
+            )
+            copied_files.append("embed_tokens_int8.npy")
+            copied_files.append("embed_tokens_scales.npy")
             continue
 
         dst_file = dst_dir / src_file.name

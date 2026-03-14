@@ -177,16 +177,23 @@ def extract_paro_params(paro_model_dir):
 class RotatedLinear(nn.Module):
     """nn.Linear wrapper with PARO block-diagonal activation rotation.
 
-    During tracing, the rotation is captured as reshape + bmm + reshape ops
-    in the OpenVINO IR. Storage overhead: num_groups * group_size^2 * 4 bytes.
-    For dim=1024, group_size=128: 8 * 128 * 128 * 4 = 512KB per layer.
+    Stores channel_scales and R^T as separate buffers instead of fused
+    M_blocks = diag(cs) @ R^T. This avoids FP16 precision loss when the
+    model is saved with compress_to_fp16=True:
+      - channel_scales: values up to ~21.6, FP16 precision ~0.07% (safe)
+      - R_blocks_T: rotation matrix values in [-1, 1], FP16 precision ~0.1% (safe)
+    The fused M_blocks mixes both ranges in a single matrix, causing error
+    accumulation through 128-element dot products across 24 layers.
+
+    During tracing, the rotation is captured as elementwise multiply +
+    reshape + bmm + reshape ops in the OpenVINO IR.
     """
 
     def __init__(self, original_linear, R_blocks, channel_scales, group_size=128):
         """
         Args:
             original_linear: nn.Linear to wrap
-            R_blocks: (num_groups, group_size, group_size) rotation matrices
+            R_blocks: (num_groups, group_size, group_size) rotation matrices (numpy, float64)
             channel_scales: (in_features,) from PARO model
             group_size: rotation group size
         """
@@ -202,10 +209,14 @@ class RotatedLinear(nn.Module):
 
         cs = np.asarray(channel_scales, dtype=np.float32).ravel()
 
-        # Build activation rotation: M_g = diag(cs_g) @ R_g^T
-        M_blocks = build_activation_rotation_blocks(R_blocks, cs, group_size)
+        # Store channel_scales and R^T separately (FP16-safe: cs values ~20, R values in [-1,1])
         self.register_buffer(
-            "M_blocks", torch.from_numpy(M_blocks)  # (ng, gs, gs) float32
+            "channel_scales_buf", torch.from_numpy(cs).reshape(1, -1)  # (1, in_features) for broadcasting
+        )
+        # R_blocks_T: (num_groups, group_size, group_size), values in [-1,1]
+        R_blocks_T = np.asarray(R_blocks, dtype=np.float32).transpose(0, 2, 1).copy()  # transpose last two dims
+        self.register_buffer(
+            "R_blocks_T", torch.from_numpy(R_blocks_T)
         )
 
         # Pre-rotate weight
@@ -222,12 +233,15 @@ class RotatedLinear(nn.Module):
     def forward(self, x):
         shape = x.shape  # (..., dim)
 
-        # Reshape to (N, num_groups, group_size) for batched rotation
-        x_flat = x.reshape(-1, self.num_groups, self.group_size)
+        # Step 1: Channel scaling (element-wise multiply, FP16-safe)
+        x_scaled = x * self.channel_scales_buf  # broadcast (1, dim) over (..., dim)
+
+        # Step 2: Block-diagonal rotation (R^T values in [-1,1], FP16-safe)
+        x_flat = x_scaled.reshape(-1, self.num_groups, self.group_size)
 
         # Batched MatMul: (ng, N, gs) @ (ng, gs, gs) -> (ng, N, gs)
         x_t = x_flat.permute(1, 0, 2)  # (ng, N, gs)
-        x_rot = torch.bmm(x_t, self.M_blocks)  # (ng, N, gs)
+        x_rot = torch.bmm(x_t, self.R_blocks_T)  # (ng, N, gs)
         x_rot = x_rot.permute(1, 0, 2)  # (N, ng, gs)
 
         # Reshape back and apply linear
