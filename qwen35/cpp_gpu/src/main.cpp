@@ -3,6 +3,10 @@
 #include <string>
 #include <chrono>
 #include <filesystem>
+#ifdef _WIN32
+#include <windows.h>
+#include <shellapi.h>  // CommandLineToArgvW
+#endif
 
 static void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog << " [options]\n"
@@ -25,7 +29,42 @@ static std::string detect_model_dir() {
     return "model";
 }
 
+#ifdef _WIN32
+// Convert wide string to UTF-8
+static std::string wstr_to_utf8(const std::wstring& ws) {
+    if (ws.empty()) return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, ws.data(), (int)ws.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.data(), (int)ws.size(), s.data(), len, nullptr, nullptr);
+    return s;
+}
+
+// Get argv as UTF-8 strings via Windows wide-char API
+static std::vector<std::string> get_utf8_args() {
+    int wargc = 0;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    std::vector<std::string> args;
+    if (wargv) {
+        for (int i = 0; i < wargc; ++i)
+            args.push_back(wstr_to_utf8(wargv[i]));
+        LocalFree(wargv);
+    }
+    return args;
+}
+#endif
+
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    // Use wide-char API to get proper UTF-8 arguments (argv uses ANSI code page)
+    auto utf8_args = get_utf8_args();
+    std::vector<const char*> utf8_ptrs;
+    for (auto& a : utf8_args) utf8_ptrs.push_back(a.c_str());
+    argc = (int)utf8_ptrs.size();
+    argv = const_cast<char**>(utf8_ptrs.data());
+#endif
+
     std::string model_dir;
     std::string prompt = "The capital of France is";
     int max_tokens = 50;
