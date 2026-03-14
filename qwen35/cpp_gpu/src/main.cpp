@@ -2,11 +2,12 @@
 #include <iostream>
 #include <string>
 #include <chrono>
+#include <filesystem>
 
 static void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog << " [options]\n"
               << "Options:\n"
-              << "  --model-dir PATH       Model directory (default: models/qwen35/Qwen3.5-0.8B-paro-ov-int4sym)\n"
+              << "  --model-dir PATH       Model directory (default: auto-detect)\n"
               << "  --prompt TEXT           Input prompt (default: \"The capital of France is\")\n"
               << "  --max-tokens N          Maximum new tokens (default: 50)\n"
               << "  --tokenizers-lib PATH   Path to openvino_tokenizers shared library\n"
@@ -14,8 +15,18 @@ static void print_usage(const char* prog) {
               << "  --help                  Show this help\n";
 }
 
+static std::string detect_model_dir() {
+    // Packaged layout: model/ next to the exe
+    if (std::filesystem::exists("model/config.json"))
+        return "model";
+    // Development layout
+    if (std::filesystem::exists("models/qwen35/Qwen3.5-0.8B-paro-ov-int4sym/config.json"))
+        return "models/qwen35/Qwen3.5-0.8B-paro-ov-int4sym";
+    return "model";
+}
+
 int main(int argc, char* argv[]) {
-    std::string model_dir = "models/qwen35/Qwen3.5-0.8B-paro-ov-int4sym";
+    std::string model_dir;
     std::string prompt = "The capital of France is";
     int max_tokens = 50;
     std::string tokenizers_lib;
@@ -42,6 +53,13 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
+
+    if (model_dir.empty())
+        model_dir = detect_model_dir();
+
+    // Auto-detect tokenizers lib next to exe (packaged layout)
+    if (tokenizers_lib.empty() && std::filesystem::exists("openvino_tokenizers.dll"))
+        tokenizers_lib = "openvino_tokenizers.dll";
 
     std::cout << "=== Qwen3.5 GPU-Only Inference (C++, Single IR, PARO) ===\n"
               << "Model dir:      " << model_dir << "\n"
