@@ -336,6 +336,24 @@ def _patch_gdn_layers_chunkwise(layers):
         gdn.recurrent_attention_cell = ChunkwiseRecurrentAttentionCell()
 
 
+def _patch_gdn_layers_singlestep(layers):
+    """Patch GDN layers with SingleStepRecurrentAttentionCell for Loop-free decode.
+
+    Uses unrolled flat ops instead of Loop node. OV traces the recurrence as
+    MatMul/Exp/Multiply/Add — no Loop, no Neumann series. Optimal for S=1.
+    """
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
+    from .chunkwise_gdn import SingleStepRecurrentAttentionCell
+
+    for layer in layers:
+        if not (hasattr(layer, "linear_attn") and isinstance(layer.linear_attn, Qwen3_5GatedDeltaNet)):
+            continue
+        gdn = layer.linear_attn
+        gdn.forward = types.MethodType(qwen3_5_gated_delta_net_forward, gdn)
+        gdn.recurrent_gated_delta_rule = patched_recurrent_gated_delta_rule
+        gdn.recurrent_attention_cell = SingleStepRecurrentAttentionCell()
+
+
 # ---------------------------------------------------------------------------
 # Export functions
 # ---------------------------------------------------------------------------
@@ -539,6 +557,89 @@ def export_gdn_prefill_block(layers, layer_indices, group_idx, text_cfg, output_
     logger.info("  Saved %s (%d ops)", path, len(list(ov_model.get_ops())))
 
 
+def export_gdn_noloop_block(layers, layer_indices, group_idx, text_cfg, output_dir):
+    """Export a GDN block (3 layers) without Loop nodes for S=1 decode.
+
+    Uses SingleStepRecurrentAttentionCell — unrolled flat ops (MatMul, Exp, Add).
+    No Loop node, no ModuleExtension needed. OV traces directly.
+    Designed for static S=1 decode (no dynamic seq dim).
+    """
+    logger.info("Exporting GDN noloop block %d (layers %s) ...", group_idx, layer_indices)
+
+    wrapper = GDNBlockWrapper(nn.ModuleList(layers), layer_indices)
+    _patch_gdn_layers_singlestep(wrapper.layers)
+    wrapper.eval()
+
+    # Dimensions
+    hidden_size = text_cfg.hidden_size
+    conv_dim = (
+        text_cfg.linear_num_key_heads * text_cfg.linear_key_head_dim * 2
+        + text_cfg.linear_num_value_heads * text_cfg.linear_value_head_dim
+    )
+    conv_kernel = text_cfg.linear_conv_kernel_dim
+    num_v_heads = text_cfg.linear_num_value_heads
+    k_head_dim = text_cfg.linear_key_head_dim
+    v_head_dim = text_cfg.linear_value_head_dim
+
+    # B=1, S=1 — static decode shape (no dynamic seq needed)
+    B, S = 1, 1
+    dummy = {
+        "hidden_states": torch.zeros(B, S, hidden_size),
+        "attention_mask": torch.ones(B, S, dtype=torch.int64),
+        "conv_state_0": torch.zeros(B, conv_dim, conv_kernel),
+        "recurrent_state_0": torch.zeros(B, num_v_heads, k_head_dim, v_head_dim),
+        "conv_state_1": torch.zeros(B, conv_dim, conv_kernel),
+        "recurrent_state_1": torch.zeros(B, num_v_heads, k_head_dim, v_head_dim),
+        "conv_state_2": torch.zeros(B, conv_dim, conv_kernel),
+        "recurrent_state_2": torch.zeros(B, num_v_heads, k_head_dim, v_head_dim),
+    }
+
+    # No extensions needed — SingleStepRecurrentAttentionCell traces directly
+    with torch.no_grad():
+        ov_model = ov.convert_model(wrapper, example_input=dummy)
+
+    # Verify no Loop nodes
+    loops = [op for op in ov_model.get_ops() if op.get_type_name() in ("Loop", "TensorIterator")]
+    if loops:
+        logger.warning("  WARNING: Found %d Loop ops in noloop block %d!", len(loops), group_idx)
+    else:
+        matmuls = sum(1 for op in ov_model.get_ops() if op.get_type_name() == "MatMul")
+        logger.info("  No Loop nodes, %d MatMul ops", matmuls)
+
+    # Name I/O (same names as decode block for compatibility with MakeStateful)
+    in_names = [
+        "in_hidden", "in_mask",
+        "in_conv0", "in_rec0",
+        "in_conv1", "in_rec1",
+        "in_conv2", "in_rec2",
+    ]
+    out_names = [
+        "out_hidden",
+        "out_conv0", "out_rec0",
+        "out_conv1", "out_rec1",
+        "out_conv2", "out_rec2",
+    ]
+
+    # Set dynamic batch only (seq is static S=1)
+    batch_sym = Symbol()
+    for i, name in enumerate(in_names):
+        ps = ov_model.inputs[i].partial_shape
+        b_dim = Dimension(-1)
+        b_dim.set_symbol(batch_sym)
+        ps[0] = b_dim
+        ov_model.inputs[i].get_node().set_partial_shape(ps)
+        ov_model.inputs[i].get_tensor().set_names({name})
+
+    for i, name in enumerate(out_names):
+        ov_model.outputs[i].get_tensor().set_names({name})
+
+    ov_model.validate_nodes_and_infer_types()
+
+    path = Path(output_dir) / f"gdn_noloop_block_{group_idx}.xml"
+    ov.save_model(ov_model, str(path), compress_to_fp16=True)
+    logger.info("  Saved %s (%d ops)", path, len(list(ov_model.get_ops())))
+
+
 def export_attn_block(layer, rotary_emb, group_idx, text_cfg, output_dir):
     """Export an attention block (1 layer) to OpenVINO IR.
 
@@ -692,10 +793,11 @@ def export_hybrid_subgraphs(model_dir: str, output_dir: str, paro_model: str | N
             gdn_layers.append(layer)
             gdn_indices.append(i)
         else:
-            # Export accumulated GDN block (decode Loop + prefill chunkwise)
+            # Export accumulated GDN block (decode Loop + prefill chunkwise + noloop decode)
             if gdn_layers:
                 export_gdn_block(gdn_layers, gdn_indices, group_idx, text_cfg, output_dir)
                 export_gdn_prefill_block(gdn_layers, gdn_indices, group_idx, text_cfg, output_dir)
+                export_gdn_noloop_block(gdn_layers, gdn_indices, group_idx, text_cfg, output_dir)
                 gdn_layers = []
                 gdn_indices = []
 
@@ -707,6 +809,7 @@ def export_hybrid_subgraphs(model_dir: str, output_dir: str, paro_model: str | N
     if gdn_layers:
         export_gdn_block(gdn_layers, gdn_indices, group_idx, text_cfg, output_dir)
         export_gdn_prefill_block(gdn_layers, gdn_indices, group_idx, text_cfg, output_dir)
+        export_gdn_noloop_block(gdn_layers, gdn_indices, group_idx, text_cfg, output_dir)
 
     # Export head
     export_head(model.model.norm, model.lm_head, text_cfg, output_dir)
@@ -726,9 +829,10 @@ def export_hybrid_subgraphs(model_dir: str, output_dir: str, paro_model: str | N
     logger.info("=== Export complete: %s ===", output_path)
     logger.info("  GDN blocks (decode Loop):  %d", group_idx)
     logger.info("  GDN blocks (prefill):      %d (chunkwise, no Loop)", group_idx)
+    logger.info("  GDN blocks (noloop S=1):   %d (unrolled, no Loop)", group_idx)
     logger.info("  Attn blocks: %d", group_idx)
     logger.info("  Head block:  1")
-    logger.info("  Total:       %d subgraphs", group_idx * 3 + 1)
+    logger.info("  Total:       %d subgraphs", group_idx * 4 + 1)
 
 
 # ---------------------------------------------------------------------------

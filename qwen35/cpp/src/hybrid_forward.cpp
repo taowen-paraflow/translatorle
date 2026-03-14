@@ -171,11 +171,14 @@ const float* Qwen35HybridModel::forward(
         // now just unmask the current position (1 float write vs 1KB memset)
         attn_mask_buf_[past_length_] = 0.0f;
 
+        // Select GDN requests: noloop (flat ops) if available, else Loop-based
+        auto& gdn_reqs = has_gdn_noloop_ ? gdn_noloop_requests_ : gdn_requests_;
+
         if (timing_) {
             // Timed decode path: 12 chrono::now() calls per token
             for (int i = 0; i < cfg_.num_blocks; ++i) {
                 auto t0 = std::chrono::steady_clock::now();
-                gdn_requests_[i].infer();
+                gdn_reqs[i].infer();
                 decode_gdn_ms_[i] += elapsed_ms(t0);
 
                 t0 = std::chrono::steady_clock::now();
@@ -202,7 +205,7 @@ const float* Qwen35HybridModel::forward(
         } else {
             // Fast decode path: no timing overhead
             for (int i = 0; i < cfg_.num_blocks; ++i) {
-                gdn_requests_[i].infer();
+                gdn_reqs[i].infer();
                 attn_requests_[i].infer();
                 std::memcpy(hidden_buf_.data(),
                             attn_requests_[i].get_output_tensor(0).data<const float>(),

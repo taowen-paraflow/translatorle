@@ -15,6 +15,7 @@ set(SOURCES
     src/main.cpp
     src/hybrid_model.cpp
     src/hybrid_forward.cpp
+    src/gdn_fuse_pass.cpp
     src/npy_reader.cpp
     src/tokenizer.cpp
 )
@@ -34,3 +35,10 @@ if(MSVC)
 endif()
 
 install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
+
+# Copy fused GDN kernel files alongside the executable
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gdn_recurrence.cl
+    ${CMAKE_CURRENT_SOURCE_DIR}/config/fused_gdn_recurrence.xml
+    DESTINATION bin
+)

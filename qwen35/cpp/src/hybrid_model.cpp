@@ -1,5 +1,6 @@
 // hybrid_model.cpp — Construction, config loading, model compilation, state init
 #include "hybrid_model.h"
+#include "gdn_fuse_pass.h"
 #include "tokenizer.h"
 #include "npy_reader.h"
 #include "utils.h"
@@ -52,7 +53,8 @@ Qwen35HybridModel::Qwen35HybridModel(
     // NPU models first (doesn't heat GPU), then GPU models.
     // This gives the GPU cooling time between compilation and inference.
     load_attn_blocks(model_dir);         // NPU — no GPU heat
-    load_gdn_blocks(model_dir);          // GPU — decode critical
+    load_gdn_blocks(model_dir);          // GPU — decode (Loop fallback)
+    load_gdn_noloop_blocks(model_dir);   // GPU — decode (flat ops, preferred)
     load_head(model_dir);                // GPU — decode critical
     if (!no_gdn_prefill) {
         load_gdn_prefill_blocks(model_dir);  // GPU — prefill only, loaded last
@@ -161,6 +163,100 @@ void Qwen35HybridModel::load_gdn_blocks(const std::string& model_dir) {
 
     init_gdn_states();
     log("  GDN compilation: " + std::to_string(elapsed_ms(t0)) + " ms (Loop-based)");
+}
+
+// ---------------------------------------------------------------------------
+// GDN noloop block loading (GPU, stateful, flat ops — no Loop node)
+// ---------------------------------------------------------------------------
+
+void Qwen35HybridModel::load_gdn_noloop_blocks(const std::string& model_dir) {
+    // Prefer quantized gdn_s1_block_*, fall back to gdn_noloop_block_*
+    std::string prefix = "gdn_s1_block_";
+    std::string test_xml = model_dir + "/" + prefix + "0.xml";
+    if (!fs::exists(test_xml)) {
+        prefix = "gdn_noloop_block_";
+        test_xml = model_dir + "/" + prefix + "0.xml";
+    }
+    if (!fs::exists(test_xml)) {
+        log("No noloop GDN blocks found, using Loop-based decode");
+        return;
+    }
+
+    log("Compiling " + std::to_string(cfg_.num_blocks) +
+        " GDN noloop blocks on GPU (stateful, no Loop)...");
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Same state map as Loop blocks — same I/O naming convention
+    std::map<std::string, std::string> state_map;
+    for (int j = 0; j < 3; ++j) {
+        state_map["in_conv" + std::to_string(j)] = "out_conv" + std::to_string(j);
+        state_map["in_rec" + std::to_string(j)] = "out_rec" + std::to_string(j);
+    }
+
+    // Locate kernel files for fused GDN recurrence (if available)
+    std::string config_xml = model_dir + "/fused_gdn_recurrence.xml";
+    std::string kernel_cl = model_dir + "/gdn_recurrence.cl";
+    bool try_fuse = fs::exists(config_xml) && fs::exists(kernel_cl);
+    if (try_fuse) {
+        log("  Found fused GDN kernel config: " + config_xml);
+    }
+
+    for (int i = 0; i < cfg_.num_blocks; ++i) {
+        std::string xml = model_dir + "/" + prefix + std::to_string(i) + ".xml";
+        auto model = core_.read_model(xml);
+
+        // Try to fuse recurrence subgraphs before MakeStateful
+        int fused = 0;
+        if (try_fuse) {
+            fused = fuse_gdn_recurrence(model);
+            if (fused > 0) {
+                log("  Block " + std::to_string(i) + ": fused " +
+                    std::to_string(fused) + " recurrence subgraphs");
+            }
+        }
+
+        ov::pass::MakeStateful(state_map).run_on_model(model);
+        model = add_f32_output_conversion(model);
+        ov::AnyMap gpu_config = {
+            {ov::hint::num_requests.name(), uint32_t(1)}
+        };
+        if (use_latency_hint_) {
+            gpu_config[ov::hint::performance_mode.name()] = ov::hint::PerformanceMode::LATENCY;
+        }
+        if (fused > 0) {
+            gpu_config["CONFIG_FILE"] = config_xml;
+        }
+        auto compiled = core_.compile_model(model, "GPU", gpu_config);
+        gdn_noloop_models_.push_back(compiled);
+        gdn_noloop_requests_.push_back(compiled.create_infer_request());
+    }
+
+    has_gdn_noloop_ = true;
+
+    // Initialize states (same layout as Loop blocks)
+    int conv_size = cfg_.conv_dim * cfg_.conv_kernel;
+    int rec_size = cfg_.num_v_heads * cfg_.k_head_dim * cfg_.v_head_dim;
+    for (auto& req : gdn_noloop_requests_) {
+        for (auto& s : req.query_state()) {
+            std::string name = s.get_name();
+            if (name.find("conv") != std::string::npos) {
+                ov::Tensor t(ov::element::f32,
+                             {1, static_cast<size_t>(cfg_.conv_dim),
+                              static_cast<size_t>(cfg_.conv_kernel)});
+                std::memset(t.data<float>(), 0, conv_size * sizeof(float));
+                s.set_state(t);
+            } else if (name.find("rec") != std::string::npos) {
+                ov::Tensor t(ov::element::f32,
+                             {1, static_cast<size_t>(cfg_.num_v_heads),
+                              static_cast<size_t>(cfg_.k_head_dim),
+                              static_cast<size_t>(cfg_.v_head_dim)});
+                std::memset(t.data<float>(), 0, rec_size * sizeof(float));
+                s.set_state(t);
+            }
+        }
+    }
+
+    log("  GDN noloop compilation: " + std::to_string(elapsed_ms(t0)) + " ms");
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +601,7 @@ void Qwen35HybridModel::init_gdn_prefill_states() {
 // ---------------------------------------------------------------------------
 
 void Qwen35HybridModel::transfer_prefill_states_to_decode() {
+    // Transfer to Loop-based decode blocks
     for (int blk = 0; blk < cfg_.num_blocks; ++blk) {
         for (auto& s : gdn_requests_[blk].query_state()) {
             std::string name = s.get_name();
@@ -516,6 +613,25 @@ void Qwen35HybridModel::transfer_prefill_states_to_decode() {
                 if (name.find("rec" + std::to_string(j)) != std::string::npos) {
                     s.set_state(gdn_prefill_rec_states_[blk][j]);
                     break;
+                }
+            }
+        }
+    }
+
+    // Transfer to noloop decode blocks (if available)
+    if (has_gdn_noloop_) {
+        for (int blk = 0; blk < cfg_.num_blocks; ++blk) {
+            for (auto& s : gdn_noloop_requests_[blk].query_state()) {
+                std::string name = s.get_name();
+                for (int j = 0; j < 3; ++j) {
+                    if (name.find("conv" + std::to_string(j)) != std::string::npos) {
+                        s.set_state(gdn_prefill_conv_states_[blk][j]);
+                        break;
+                    }
+                    if (name.find("rec" + std::to_string(j)) != std::string::npos) {
+                        s.set_state(gdn_prefill_rec_states_[blk][j]);
+                        break;
+                    }
                 }
             }
         }
@@ -550,6 +666,14 @@ void Qwen35HybridModel::bind_decode_tensors() {
         gdn_req.set_input_tensor(1, s1_gdn_mask_);
         gdn_req.set_output_tensor(0, s1_hidden_);
 
+        // Noloop blocks have same I/O after MakeStateful: hidden + mask → hidden
+        if (has_gdn_noloop_) {
+            auto& noloop_req = gdn_noloop_requests_[i];
+            noloop_req.set_input_tensor(0, s1_hidden_);
+            noloop_req.set_input_tensor(1, s1_gdn_mask_);
+            noloop_req.set_output_tensor(0, s1_hidden_);
+        }
+
         auto& attn_req = attn_requests_[i];
         attn_req.set_input_tensor(0, s1_hidden_);
         attn_req.set_input_tensor(1, s1_pos_);
@@ -570,6 +694,30 @@ void Qwen35HybridModel::bind_decode_tensors() {
 
 void Qwen35HybridModel::reset() {
     init_gdn_states();
+    // Reset noloop block states
+    if (has_gdn_noloop_) {
+        int conv_size = cfg_.conv_dim * cfg_.conv_kernel;
+        int rec_size = cfg_.num_v_heads * cfg_.k_head_dim * cfg_.v_head_dim;
+        for (auto& req : gdn_noloop_requests_) {
+            for (auto& s : req.query_state()) {
+                std::string name = s.get_name();
+                if (name.find("conv") != std::string::npos) {
+                    ov::Tensor t(ov::element::f32,
+                                 {1, static_cast<size_t>(cfg_.conv_dim),
+                                  static_cast<size_t>(cfg_.conv_kernel)});
+                    std::memset(t.data<float>(), 0, conv_size * sizeof(float));
+                    s.set_state(t);
+                } else if (name.find("rec") != std::string::npos) {
+                    ov::Tensor t(ov::element::f32,
+                                 {1, static_cast<size_t>(cfg_.num_v_heads),
+                                  static_cast<size_t>(cfg_.k_head_dim),
+                                  static_cast<size_t>(cfg_.v_head_dim)});
+                    std::memset(t.data<float>(), 0, rec_size * sizeof(float));
+                    s.set_state(t);
+                }
+            }
+        }
+    }
     if (has_gdn_prefill_) {
         // Prefill blocks have separate state buffers — zero them
         for (int blk = 0; blk < cfg_.num_blocks; ++blk) {

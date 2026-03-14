@@ -181,6 +181,12 @@ def main():
         help="Quantization for GDN blocks (default: %(default)s).",
     )
     parser.add_argument(
+        "--gdn-s1-mode",
+        default=None,
+        choices=["fp16", "int4_sym", "int8_sym", "int8_asym"],
+        help="Quantization for GDN S1 (no-Loop) blocks (default: same as --gdn-mode)",
+    )
+    parser.add_argument(
         "--head-mode",
         default="fp16",
         choices=["fp16", "int4_sym", "int4_asym", "int8_sym", "int8_asym"],
@@ -209,6 +215,9 @@ def main():
             parts.append(f"attn-{args.attn_mode.replace('_', '')}")
         if args.gdn_mode != "fp16":
             parts.append(f"gdn-{args.gdn_mode.replace('_', '')}")
+        s1_mode = args.gdn_s1_mode or args.gdn_mode
+        if s1_mode != args.gdn_mode and s1_mode != "fp16":
+            parts.append(f"gdns1-{s1_mode.replace('_', '')}")
         if args.head_mode != "fp16":
             parts.append(f"head-{args.head_mode.replace('_', '')}")
         if not parts:
@@ -224,6 +233,8 @@ def main():
     print(f"Settings:")
     print(f"  Attention blocks: {args.attn_mode}")
     print(f"  GDN blocks:       {args.gdn_mode}")
+    if args.gdn_s1_mode and args.gdn_s1_mode != args.gdn_mode:
+        print(f"  GDN S1 blocks:    {args.gdn_s1_mode}")
     print(f"  Head block:       {args.head_mode}")
     print(f"  Group size:       {args.group_size}")
     print()
@@ -239,7 +250,8 @@ def main():
             subgraphs.append((f"gdn_prefill_block_{i}", args.gdn_mode, "GDN"))
         # Also quantize S1 (no-Loop) GDN decode blocks
         if (src_dir / f"gdn_s1_block_{i}.xml").exists():
-            subgraphs.append((f"gdn_s1_block_{i}", args.gdn_mode, "GDN"))
+            s1_mode = args.gdn_s1_mode or args.gdn_mode
+            subgraphs.append((f"gdn_s1_block_{i}", s1_mode, "GDN-S1"))
     for i in range(NUM_ATTN_BLOCKS):
         subgraphs.append((f"attn_block_{i}", args.attn_mode, "Attn"))
     subgraphs.append(("head", args.head_mode, "Head"))
@@ -345,7 +357,7 @@ def main():
     print("-" * 72)
 
     # Category subtotals
-    for category in ["GDN", "Attn", "Head"]:
+    for category in ["GDN", "GDN-S1", "Attn", "Head"]:
         if category in category_stats:
             co, cc = category_stats[category]
             ratio_str = f"{co / cc:.1f}x" if cc > 0 and co != cc else "---"

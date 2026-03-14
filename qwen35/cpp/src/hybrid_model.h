@@ -57,6 +57,7 @@ public:
 private:
     ModelConfig load_config(const std::string& model_dir);
     void load_gdn_blocks(const std::string& model_dir);
+    void load_gdn_noloop_blocks(const std::string& model_dir);
     void load_gdn_prefill_blocks(const std::string& model_dir);
     void load_attn_blocks(const std::string& model_dir);
     void load_head(const std::string& model_dir);
@@ -108,8 +109,14 @@ private:
     ov::Core core_;
 
     // GDN blocks — GPU, stateful (conv/recurrent state persists in GPU memory)
+    // Loop-based (fallback for multi-token S>1)
     std::vector<ov::CompiledModel> gdn_models_;
     std::vector<ov::InferRequest> gdn_requests_;
+
+    // GDN noloop blocks — GPU, stateful (flat ops, no Loop, S=1 decode only)
+    std::vector<ov::CompiledModel> gdn_noloop_models_;
+    std::vector<ov::InferRequest> gdn_noloop_requests_;
+    bool has_gdn_noloop_ = false;
 
     // GDN prefill blocks — GPU, explicit I/O (chunkwise parallel, no Loop)
     std::vector<ov::CompiledModel> gdn_prefill_models_;

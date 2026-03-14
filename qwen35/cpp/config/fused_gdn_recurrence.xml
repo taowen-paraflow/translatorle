@@ -1,0 +1,19 @@
+<CustomLayer name="FusedGDNRecurrence" type="SimpleGPU" version="1">
+    <Kernel entry="fused_gdn_recurrence">
+        <Source filename="gdn_recurrence.cl"/>
+    </Kernel>
+    <Buffers>
+        <!-- Inputs -->
+        <Tensor arg-index="0" type="input" port-index="0" format="BFYX"/>
+        <Tensor arg-index="1" type="input" port-index="1" format="BFYX"/>
+        <Tensor arg-index="2" type="input" port-index="2" format="BFYX"/>
+        <Tensor arg-index="3" type="input" port-index="3" format="BFYX"/>
+        <Tensor arg-index="4" type="input" port-index="4" format="BFYX"/>
+        <Tensor arg-index="5" type="input" port-index="5" format="BFYX"/>
+        <!-- Single output: concatenated [attn_flat(2048) | state_flat(262144)] -->
+        <Tensor arg-index="6" type="output" port-index="0" format="BFYX"/>
+    </Buffers>
+    <CompilerOptions options="-cl-mad-enable -cl-fast-relaxed-math"/>
+    <!-- 16 work groups (heads) x 128 work items (state columns) -->
+    <WorkSizes global="2048,1,1" local="128,1,1"/>
+</CustomLayer>

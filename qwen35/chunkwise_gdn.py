@@ -132,6 +132,74 @@ class ChunkwiseRecurrentAttentionCell(nn.Module):
         return N
 
 
+class SingleStepRecurrentAttentionCell(nn.Module):
+    """Loop-free GDN recurrence for S=1 decode.
+
+    Expresses the single-step GDN recurrence as flat ops (MatMul, Exp, Multiply,
+    Add) — no Loop node, no Neumann series. The GPU plugin compiles these into
+    an efficient fused graph, eliminating the CPU-orchestrated Loop overhead.
+
+    Drop-in replacement for RecurrentAttentionCell with identical interface.
+    Works for any T but is optimized for T=1 (decode).
+    """
+
+    def forward(self, q, k, v, g, beta, last_recurrent_state):
+        """
+        Args:
+            q: (B, H, T, D_k) - queries
+            k: (B, H, T, D_k) - keys (L2-normalized in Qwen3.5)
+            v: (B, H, T, D_v) - values
+            g: (B, H, T) - log-space gate (exp(g) = decay factor)
+            beta: (B, H, T) - input gate / learning rate
+            last_recurrent_state: (B, H, D_k, D_v) - initial recurrent state
+
+        Returns:
+            (output_flat, state_flat) concatenated - matching Loop version format
+            output: (B, H, T, D_v) flattened
+            state: (B, H, D_k, D_v) flattened
+        """
+        B, H, T, D_k = q.shape
+        D_v = v.shape[-1]
+        state = last_recurrent_state  # (B, H, D_k, D_v)
+        outputs = []
+
+        # Unrolled loop — OV traces each iteration as flat ops (no Loop node).
+        # For T=1 decode, this is a single iteration.  For T>1, OV duplicates
+        # the subgraph T times (only correct when T matches trace-time T).
+        for t in range(T):
+            q_t = q[:, :, t]      # (B, H, D_k)
+            k_t = k[:, :, t]      # (B, H, D_k)
+            v_t = v[:, :, t]      # (B, H, D_v)
+            g_t = g[:, :, t]      # (B, H)
+            beta_t = beta[:, :, t]  # (B, H)
+
+            # Gated decay: state *= exp(g)
+            decay = torch.exp(g_t).unsqueeze(-1).unsqueeze(-1)  # (B, H, 1, 1)
+            state = state * decay
+
+            # Retrieve: kv_mem = state^T @ k  (memory retrieval)
+            k_unsq = k_t.unsqueeze(-1)           # (B, H, D_k, 1)
+            kv_mem = (state * k_unsq).sum(dim=-2)  # (B, H, D_v)
+
+            # Delta: (v - kv_mem) * beta
+            delta = (v_t - kv_mem) * beta_t.unsqueeze(-1)  # (B, H, D_v)
+
+            # State update: rank-1 outer product
+            state = state + k_unsq * delta.unsqueeze(-2)  # (B, H, D_k, D_v)
+
+            # Query output: out = state^T @ q
+            q_unsq = q_t.unsqueeze(-1)           # (B, H, D_k, 1)
+            out_t = (state * q_unsq).sum(dim=-2)  # (B, H, D_v)
+            outputs.append(out_t)
+
+        output = torch.stack(outputs, dim=2)  # (B, H, T, D_v)
+
+        # Flatten and concatenate (matching Loop version output format)
+        output_flat = output.reshape(-1)
+        state_flat = state.reshape(-1)
+        return torch.cat([output_flat, state_flat], dim=0)
+
+
 def sequential_gdn(q, k, v, g, beta, initial_state):
     """Sequential per-token GDN recurrence (reference matching ov_ops.py Loop)."""
     B, H, T, D_k = q.shape
@@ -216,6 +284,52 @@ if __name__ == "__main__":
         status = "PASS" if (out_match and state_match) else "FAIL"
         dtype_str = "f64" if dtype == torch.float64 else "f32"
         print(f"  [{status}] {desc}: T={T}, {dtype_str}, "
+              f"out_diff={out_diff:.2e}, state_diff={state_diff:.2e}")
+        if not (out_match and state_match):
+            all_pass = False
+
+    # ================================================================
+    # Test 1b: SingleStepRecurrentAttentionCell Verification
+    # ================================================================
+    print("\n=== SingleStep Cell Verification ===\n")
+
+    ss_cell = SingleStepRecurrentAttentionCell()
+
+    ss_configs = [
+        (1, 16, 1, 128, 128, True, torch.float32, 1e-5, 1e-4, "T=1 full dims"),
+        (1, 16, 1, 128, 128, False, torch.float32, 1e-5, 1e-4, "T=1 no key norm"),
+        (1, 1, 1, 4, 4, False, torch.float64, 1e-12, 1e-10, "T=1 tiny f64"),
+    ]
+
+    for B, H, T, D_k, D_v, normalize_keys, dtype, atol, rtol, desc in ss_configs:
+        torch.manual_seed(42)
+        q = torch.randn(B, H, T, D_k, dtype=dtype)
+        k = torch.randn(B, H, T, D_k, dtype=dtype)
+        v = torch.randn(B, H, T, D_v, dtype=dtype)
+        g = torch.randn(B, H, T, dtype=dtype) * 0.1
+        beta = torch.sigmoid(torch.randn(B, H, T, dtype=dtype))
+        initial_state = torch.randn(B, H, D_k, D_v, dtype=dtype) * 0.01
+
+        if normalize_keys:
+            k = torch.nn.functional.normalize(k, dim=-1)
+
+        out_seq, state_seq = sequential_gdn(q, k, v, g, beta, initial_state)
+
+        with torch.no_grad():
+            result = ss_cell(q, k, v, g, beta, initial_state)
+
+        output_size = B * H * T * D_v
+        out_ss = result[:output_size].reshape(B, H, T, D_v)
+        state_ss = result[output_size:].reshape(B, H, D_k, D_v)
+
+        out_diff = (out_seq - out_ss).abs().max().item()
+        state_diff = (state_seq - state_ss).abs().max().item()
+        out_match = torch.allclose(out_seq, out_ss, atol=atol, rtol=rtol)
+        state_match = torch.allclose(state_seq, state_ss, atol=atol, rtol=rtol)
+
+        status = "PASS" if (out_match and state_match) else "FAIL"
+        dtype_str = "f64" if dtype == torch.float64 else "f32"
+        print(f"  [{status}] {desc}: {dtype_str}, "
               f"out_diff={out_diff:.2e}, state_diff={state_diff:.2e}")
         if not (out_match and state_match):
             all_pass = False
