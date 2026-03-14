@@ -64,11 +64,19 @@ foreach ($dll in $tbbDlls) {
     Write-Host "  Copied $($dll.Name)"
 }
 
-# 3. Copy openvino_tokenizers extension
+# 3. Copy openvino_tokenizers extension + ICU dependencies
 $tokDll = "$tokLibDir\openvino_tokenizers.dll"
 if (Test-Path $tokDll) {
     Copy-Item $tokDll "$stageDir\openvino_tokenizers.dll"
     Write-Host "  Copied openvino_tokenizers.dll"
+    # ICU unicode libraries required by openvino_tokenizers
+    foreach ($icu in @("icuuc70.dll", "icudt70.dll")) {
+        $icuSrc = "$tokLibDir\$icu"
+        if (Test-Path $icuSrc) {
+            Copy-Item $icuSrc "$stageDir\$icu"
+            Write-Host "  Copied $icu"
+        }
+    }
 }
 
 # 4. Copy model files
