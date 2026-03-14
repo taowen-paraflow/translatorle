@@ -43,6 +43,7 @@ $ovDlls = @(
     "openvino.dll",
     "openvino_c.dll",
     "openvino_intel_gpu_plugin.dll",
+    "openvino_intel_cpu_plugin.dll",
     "openvino_auto_plugin.dll",
     "openvino_auto_batch_plugin.dll",
     "openvino_ir_frontend.dll",
