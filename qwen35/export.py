@@ -678,11 +678,20 @@ def export_model(
     model_dir: str,
     output_dir: str,
     compress_to_fp16: bool = True,
+    paro_model: Optional[str] = None,
+    embed_int8: bool = False,
 ) -> None:
     """Export a Qwen3.5 PyTorch model to a stateful OpenVINO IR.
 
     Uses ModuleExtension + ConversionExtension to convert GDN recurrence
     into OpenVINO Loop nodes, enabling dynamic sequence length.
+
+    Parameters
+    ----------
+    paro_model : str, optional
+        Path to PARO model directory for rotation-based quantization.
+    embed_int8 : bool
+        If True, export embed_tokens as INT8 per-row symmetric quantized.
     """
     model_path = Path(model_dir)
     out_path = Path(output_dir)
@@ -705,6 +714,18 @@ def export_model(
         if hasattr(model.config, "text_config")
         else model.config
     )
+
+    # 2b. Apply PARO rotation to linear layers (before tracing)
+    if paro_model:
+        from .paro_rotation import extract_paro_params, apply_paro_rotation_to_module
+        logger.info("Applying PARO rotation from %s ...", paro_model)
+        paro_params = extract_paro_params(paro_model)
+        total_rotated = 0
+        for i, layer in enumerate(model.model.layers):
+            layer_prefix = f"layers.{i}"
+            n = apply_paro_rotation_to_module(layer, paro_params, layer_prefix)
+            total_rotated += n
+        logger.info("PARO rotation applied to %d linear layers", total_rotated)
 
     # 3. Generate dummy inputs (seq_len=2 for proper Loop tracing)
     logger.info("Generating dummy inputs ...")
@@ -770,9 +791,21 @@ def export_model(
 
     # 11b. Extract embedding table for external lookup
     embed_table = model.model.embed_tokens.weight.detach().cpu().numpy()
-    embed_path = out_path / "embed_tokens.npy"
-    np.save(str(embed_path), embed_table.astype(np.float16))
-    logger.info("Saved embed_tokens.npy: shape=%s, dtype=float16", embed_table.shape)
+    if embed_int8:
+        # INT8 per-row symmetric quantization (2x smaller)
+        embed_fp32 = embed_table.astype(np.float32)
+        scales = np.max(np.abs(embed_fp32), axis=1, keepdims=True) / 127.0
+        scales = np.where(scales == 0, 1.0, scales)
+        embed_int8_data = np.round(embed_fp32 / scales).astype(np.int8)
+        scales_fp16 = scales.squeeze().astype(np.float16)
+        np.save(str(out_path / "embed_tokens_int8.npy"), embed_int8_data)
+        np.save(str(out_path / "embed_tokens_scales.npy"), scales_fp16)
+        logger.info("Saved embed_tokens_int8.npy: shape=%s + scales: shape=%s",
+                     embed_int8_data.shape, scales_fp16.shape)
+    else:
+        embed_path = out_path / "embed_tokens.npy"
+        np.save(str(embed_path), embed_table.astype(np.float16))
+        logger.info("Saved embed_tokens.npy: shape=%s, dtype=float16", embed_table.shape)
 
     # 12. Copy tokenizer / config files
     _copy_tokenizer_and_config(model_path, out_path)
@@ -783,3 +816,54 @@ def export_model(
     del model
 
     logger.info("Export complete: %s", out_path)
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import argparse
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    parser = argparse.ArgumentParser(description="Export Qwen3.5 to stateful OpenVINO IR")
+    parser.add_argument(
+        "--model-dir",
+        default="Qwen/Qwen3.5-0.8B",
+        help="HuggingFace model ID or local directory (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output directory (default: models/qwen35/Qwen3.5-0.8B-ov)",
+    )
+    parser.add_argument(
+        "--paro-model",
+        default=None,
+        help="Path to PARO model for rotation-based INT4 quantization",
+    )
+    parser.add_argument(
+        "--embed-int8",
+        action="store_true",
+        help="Export embed_tokens as INT8 per-row quantized (2x smaller)",
+    )
+    parser.add_argument(
+        "--no-fp16",
+        action="store_true",
+        help="Do not compress weights to FP16",
+    )
+    args = parser.parse_args()
+
+    if args.output_dir is None:
+        name = Path(args.model_dir).name
+        suffix = "-paro" if args.paro_model else ""
+        args.output_dir = f"models/qwen35/{name}{suffix}-ov"
+
+    export_model(
+        model_dir=args.model_dir,
+        output_dir=args.output_dir,
+        compress_to_fp16=not args.no_fp16,
+        paro_model=args.paro_model,
+        embed_int8=args.embed_int8,
+    )
