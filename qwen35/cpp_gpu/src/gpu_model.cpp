@@ -110,7 +110,7 @@ void Qwen35GPUModel::load_model(const std::string& model_dir) {
     }
 
     ov::AnyMap gpu_config = {
-        {ov::hint::num_requests.name(), uint32_t(1)}
+        {ov::hint::num_requests.name(), uint32_t(1)},
     };
     compiled_ = core_.compile_model(model, "GPU", gpu_config);
     request_ = compiled_.create_infer_request();
@@ -249,9 +249,11 @@ std::string Qwen35GPUModel::generate(const std::string& prompt, int max_new_toke
         request_.set_tensor("position_ids", pos_tensor);
     }
 
+    // beam_idx must be function-scoped (not block-scoped) so the tensor
+    // memory stays alive through infer().  IR port type is i32.
+    int32_t prefill_beam = 0;
     if (has_beam_idx_) {
-        int32_t beam = 0;
-        ov::Tensor beam_tensor(ov::element::i32, {1}, &beam);
+        ov::Tensor beam_tensor(ov::element::i32, {1}, &prefill_beam);
         request_.set_tensor("beam_idx", beam_tensor);
     }
 
